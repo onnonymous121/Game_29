@@ -20,7 +20,7 @@ initializeApp({
 const User = require('./models/User');
 
 // Game 29 মডিউল ইমপোর্ট (ফোল্ডারের নাম অনুযায়ী পাথ নিশ্চিত করুন)
-const game29Module = require('./games/game_29');
+const game29Module = require('./games/game29');
 
 const app = express();
 app.use(express.json());
