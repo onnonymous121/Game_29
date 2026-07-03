@@ -59,12 +59,8 @@ app.post('/api/login', async (req, res) => {
       await user.save();
     }
 
-    // ── BACKEND TIP APPLIED HERE ──
-    // ডাটাবেজে অরিজিনাল নাম থাকলেও, রেসপন্সে আমরা nickname কে প্রাধান্য দিচ্ছি (যদি থাকে)।
-    // এর ফলে ফ্রন্ট-এন্ডে ইউজার তার সেট করা নিকনেমটিই দেখতে পাবে।
     const responseUser = user.toObject();
     responseUser.name = user.nickname ? user.nickname : user.name;
-    // ──────────────────────────────
 
     res.json({ success: true, user: responseUser });
   } catch (error) {
@@ -72,14 +68,12 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ── নতুন আপডেট করা নাম পরিবর্তন API ──
 app.post('/api/update-name', async (req, res) => {
   const { uid, newNickname } = req.body;
   try {
     const user = await User.findOne({ uid });
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    // ১. ৭ দিনের লিমিট চেক
     if (user.lastNicknameChange) {
       const oneWeek = 7 * 24 * 60 * 60 * 1000;
       if (Date.now() - new Date(user.lastNicknameChange).getTime() < oneWeek) {
@@ -87,11 +81,9 @@ app.post('/api/update-name', async (req, res) => {
       }
     }
 
-    // ২. নিকনেম ইউনিক কিনা চেক
     const existing = await User.findOne({ nickname: newNickname });
     if (existing) return res.status(400).json({ error: 'Nickname already taken!' });
 
-    // ৩. আপডেট
     user.nickname = newNickname;
     user.lastNicknameChange = new Date();
     await user.save();
@@ -99,6 +91,47 @@ app.post('/api/update-name', async (req, res) => {
     res.json({ success: true, nickname: user.nickname });
   } catch (error) {
     res.status(500).json({ error: 'Update Failed' });
+  }
+});
+
+// ── নতুন API: রিওয়ার্ড অ্যাড দেখে কয়েন অর্জন ──
+app.post('/api/reward-coins', async (req, res) => {
+  const { uid } = req.body;
+  try {
+    const user = await User.findOne({ uid });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const DAILY_AD_LIMIT = 10; // প্রতিদিন সর্বোচ্চ ১০টি অ্যাড
+    const REWARD_COINS = 250;  // প্রতি অ্যাডে ২৫০ কয়েন
+    const now = new Date();
+
+    // নতুন দিন শুরু হলে অ্যাডের কাউন্ট রিসেট করা
+    if (user.lastAdDate) {
+      const lastDate = new Date(user.lastAdDate);
+      if (lastDate.toDateString() !== now.toDateString()) {
+        user.dailyAdCount = 0;
+      }
+    }
+
+    // লিমিট চেক করা
+    if (user.dailyAdCount >= DAILY_AD_LIMIT) {
+      return res.status(400).json({ error: 'Daily ad limit reached. Come back tomorrow!' });
+    }
+
+    // কয়েন আপডেট করা
+    user.coins += REWARD_COINS;
+    user.dailyAdCount += 1;
+    user.lastAdDate = now;
+    await user.save();
+
+    res.json({ 
+      success: true, 
+      coins: user.coins, 
+      dailyAdCount: user.dailyAdCount,
+      message: `Earned ${REWARD_COINS} coins!`
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to process reward' });
   }
 });
 
