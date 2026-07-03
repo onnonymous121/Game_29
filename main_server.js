@@ -86,8 +86,7 @@ app.post('/api/login', async (req, res) => {
       user = new User({
         uid: uid,
         name: name,
-        nickname: name, // প্রথমবার আসল নামটাই নিকনেম হিসেবে সেট হবে
-        coins: 5000, 
+        coins: 5000, // ওয়েলকাম বোনাস
         level: 1,
       });
       await user.save();
@@ -105,13 +104,12 @@ app.post('/api/login', async (req, res) => {
 });
 
 // ============================================================
-// API: Update Guest Nickname (নতুন)
+// API: Update Guest Name
 // ============================================================
-app.post('/api/update-nickname', async (req, res) => {
-  const { uid, newNickname } = req.body;
+app.post('/api/update-name', async (req, res) => {
+  const { uid, newName } = req.body;
   try {
-    // শুধুমাত্র nickname ফিল্ডটি আপডেট হবে, আসল name ঠিক থাকবে
-    const user = await User.findOneAndUpdate({ uid }, { nickname: newNickname }, { new: true });
+    const user = await User.findOneAndUpdate({ uid }, { name: newName }, { new: true });
     if (user) {
       res.json({ success: true, user });
     } else {
