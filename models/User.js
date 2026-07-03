@@ -1,9 +1,11 @@
 const mongoose = require('mongoose');
 
 const userSchema = new mongoose.Schema({
-  uid: { type: String, required: true, unique: true }, // ফায়ারবেস থেকে পাওয়া আইডি বা গেস্ট আইডি
-  name: { type: String, default: 'Guest Player' },
-  coins: { type: Number, default: 5000 }, // গেম শুরু করার জন্য ৫০০০ ফ্রি কয়েন
+  uid: { type: String, required: true, unique: true },
+  name: { type: String, default: 'Guest Player' }, // জিমেইল/অরিজিনাল নাম
+  nickname: { type: String, default: null }, // ইউজার সেট করা ইউনিক নাম
+  lastNicknameChange: { type: Date, default: null }, // নাম পরিবর্তনের সময় ট্র্যাক করার জন্য
+  coins: { type: Number, default: 5000 },
   level: { type: Number, default: 1 },
   xp: { type: Number, default: 0 },
   game29Stats: {
