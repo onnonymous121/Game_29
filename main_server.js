@@ -58,7 +58,15 @@ app.post('/api/login', async (req, res) => {
       user = new User({ uid: uid, name: name, coins: 5000, level: 1 });
       await user.save();
     }
-    res.json({ success: true, user: user });
+
+    // ── BACKEND TIP APPLIED HERE ──
+    // ডাটাবেজে অরিজিনাল নাম থাকলেও, রেসপন্সে আমরা nickname কে প্রাধান্য দিচ্ছি (যদি থাকে)।
+    // এর ফলে ফ্রন্ট-এন্ডে ইউজার তার সেট করা নিকনেমটিই দেখতে পাবে।
+    const responseUser = user.toObject();
+    responseUser.name = user.nickname ? user.nickname : user.name;
+    // ──────────────────────────────
+
+    res.json({ success: true, user: responseUser });
   } catch (error) {
     res.status(500).json({ error: 'Authentication Failed' });
   }
