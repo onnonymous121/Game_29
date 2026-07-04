@@ -335,6 +335,7 @@ function botChooseTrump(roomCode, idx) {
   gs.isWaitingForTrump = false;
   gs.trumpSuit = best ? best[0] : SUITS[0];
   gs.isTrumpRevealed = false;
+  
   rm.gameEvent(roomCode, 'TRUMP_SET', { suit: 'HIDDEN' });
   finishDealing(roomCode);
 }
@@ -639,8 +640,16 @@ function botPlay(roomCode, idx) {
   checkAndShowPairAuto(roomCode, idx);
 
   let card;
+  
+  // ── স্মার্ট এআই লজিক: প্রথম চাল দেওয়ার সময় ──
   if (gs.currentTrick.length === 0) {
-    card = hand.reduce((a, b) => cardPower(a) > cardPower(b) ? a : b);
+    const aces = hand.filter(c => cardRank(c) === 'a');
+    if (aces.length > 0) {
+      // যদি টেক্কা থাকে, সেটা আগে খেলে পয়েন্ট নিশ্চিত করবে
+      card = aces[Math.floor(Math.random() * aces.length)];
+    } else {
+      card = hand.reduce((a, b) => cardPower(a) > cardPower(b) ? a : b);
+    }
   } else {
     const lead = gs.leadSuit;
     const followSuit = hand.filter(c => cardSuit(c) === lead);
@@ -664,16 +673,27 @@ function botPlay(roomCode, idx) {
 
     if (followSuit.length) {
       if (isPartnerWinning) {
+        // ── স্মার্ট এআই লজিক: পার্টনারকে পয়েন্ট গছানো ──
         card = followSuit.reduce((a, b) => cardValue(a) > cardValue(b) ? a : b);
       } else {
         card = followSuit.reduce((a, b) => cardPower(a) > cardPower(b) ? a : b);
       }
     } else {
-      const trumpCards = hand.filter(c => cardSuit(c) === gs.trumpSuit);
-      if (trumpCards.length && !isPartnerWinning) {
-        card = trumpCards.reduce((a, b) => cardPower(a) < cardPower(b) ? a : b);
+      if (isPartnerWinning) {
+        // রঙ না থাকলে অন্য রঙের সবচেয়ে বেশি পয়েন্টের তাস (১০ বা টেক্কা) পার্টনারকে দিয়ে দেবে
+        const nonTrumps = hand.filter(c => cardSuit(c) !== gs.trumpSuit);
+        if (nonTrumps.length) {
+          card = nonTrumps.reduce((a, b) => cardValue(a) > cardValue(b) ? a : b);
+        } else {
+          card = hand[0];
+        }
       } else {
-        card = hand.reduce((a, b) => (cardValue(a) + cardPower(a)) < (cardValue(b) + cardPower(b)) ? a : b);
+        const trumpCards = hand.filter(c => cardSuit(c) === gs.trumpSuit);
+        if (trumpCards.length) {
+          card = trumpCards.reduce((a, b) => cardPower(a) < cardPower(b) ? a : b);
+        } else {
+          card = hand.reduce((a, b) => (cardValue(a) + cardPower(a)) < (cardValue(b) + cardPower(b)) ? a : b);
+        }
       }
     }
   }
@@ -746,6 +766,10 @@ function evaluateTrick(roomCode) {
       code: 'SingleHandLost',
     });
     room.status = 'WAITING';
+    
+    // সিঙ্গেল হ্যান্ড হারলে বিপক্ষ দল জয়ী হবে
+    const opponentTeam = declTeam === 0 ? [1, 3] : [0, 2];
+    rm.resolveUniversalGame(roomCode, opponentTeam);
     return;
   }
 
@@ -757,25 +781,35 @@ function evaluateTrick(roomCode) {
   }
 }
 
+// ── RESOLVE ROUND ─────────────────────────────────────────────
 function resolveRound(roomCode) {
   const room = rm.rooms.get(roomCode);
   if (!room || !room.game) return;
   const gs = room.game;
 
   let code = '';
+  let winningSlots = [];
+
   if (gs.singleHandDeclarer !== -1) {
     const declTeam = gs.singleHandDeclarer % 2;
     gs.gamePoints[declTeam] += 6;
     code = 'SingleHandWon';
+    // সিঙ্গেল হ্যান্ড জিতলে ডিক্লেয়ারারের দল জয়ী হবে
+    winningSlots = declTeam === 0 ? [0, 2] : [1, 3];
   } else {
     const bidTeam = gs.bidder % 2;
     const bidderScore = gs.teamScores[bidTeam];
+    
     if (bidderScore >= gs.currentBid) {
       gs.gamePoints[bidTeam] += (1 * gs.gamePointMultiplier);
       code = bidTeam === 0 ? 'Won' : 'ThemWon';
+      // বিডার জিতলে তার দল জয়ী হবে
+      winningSlots = bidTeam === 0 ? [0, 2] : [1, 3];
     } else {
       gs.gamePoints[bidTeam] -= (1 * gs.gamePointMultiplier);
       code = bidTeam === 0 ? 'Lost' : 'ThemLost';
+      // বিডার হারলে বিপক্ষ দল জয়ী হবে
+      winningSlots = bidTeam === 0 ? [1, 3] : [0, 2];
     }
   }
 
@@ -792,6 +826,9 @@ function resolveRound(roomCode) {
   });
 
   room.status = 'WAITING';
+
+  // ── সেন্ট্রাল ইউনিভার্সাল গেম রেজোলিউশন ফাংশন কল করা হলো ──
+  rm.resolveUniversalGame(roomCode, winningSlots);
 }
 
 // ============================================================

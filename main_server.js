@@ -13,7 +13,7 @@ const serviceAccount = require('./serviceAccountKey.json');
 initializeApp({ credential: cert(serviceAccount) });
 
 const User = require('./models/User');
-const roomManager = require('./roomManager'); // ── নতুন সেন্ট্রাল রুম ম্যানেজার ──
+const roomManager = require('./roomManager');
 
 const app = express();
 app.use(express.json());
@@ -32,7 +32,6 @@ const wss = new WebSocketServer({ noServer: true });
 httpServer.on('upgrade', (request, socket, head) => {
   const { pathname } = parse(request.url);
   wss.handleUpgrade(request, socket, head, (ws) => {
-    // ── গ্লোবাল ওয়েবসকেট রাউটিং ──
     if (pathname === '/ws/game29' || pathname === '/ws/games') {
       roomManager.handleConnection(ws);
     } else {
@@ -56,7 +55,7 @@ app.post('/api/login', async (req, res) => {
 
     let user = await User.findOne({ uid: uid });
     if (!user) {
-      user = new User({ uid: uid, name: name, coins: 5000, level: 1 });
+      user = new User({ uid: uid, name: name, coins: 5000, level: 1, xp: 0 });
       await user.save();
     }
 
@@ -132,7 +131,48 @@ app.post('/api/reward-coins', async (req, res) => {
   }
 });
 
-// ফ্রন্টএন্ডের সুবিধার জন্য পুরনো পাথ /game29 তেই রাউটারটি মাউন্ট করা হলো
+// ── নতুন API: প্লেয়ারদের মধ্যে কয়েন ট্রান্সফার ──
+app.post('/api/transfer-coins', async (req, res) => {
+  const { senderUid, receiverUid, amount } = req.body;
+  
+  try {
+    const transferAmount = parseInt(amount, 10);
+
+    if (!transferAmount || transferAmount <= 0) {
+      return res.status(400).json({ error: 'Invalid amount.' });
+    }
+    if (senderUid === receiverUid) {
+      return res.status(400).json({ error: 'You cannot send coins to yourself.' });
+    }
+
+    const sender = await User.findOne({ uid: senderUid });
+    const receiver = await User.findOne({ uid: receiverUid });
+
+    if (!sender) return res.status(404).json({ error: 'Sender not found.' });
+    if (!receiver) return res.status(404).json({ error: 'Receiver not found. Check the UID.' });
+
+    if (sender.coins < transferAmount) {
+      return res.status(400).json({ error: 'Insufficient coins.' });
+    }
+
+    // ব্যালেন্স আপডেট
+    sender.coins -= transferAmount;
+    receiver.coins += transferAmount;
+
+    await sender.save();
+    await receiver.save();
+
+    res.json({ 
+      success: true, 
+      message: `Successfully sent ${transferAmount} coins to ${receiver.nickname || receiver.name}!`,
+      senderCoins: sender.coins 
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Transfer Failed due to a server error.' });
+  }
+});
+
+// ফ্রন্টএন্ডের সুবিধার জন্য গ্লোবাল রাউটার মাউন্ট করা হলো
 app.use('/game29', roomManager.router);
 
 app.get('/', (req, res) => res.send('Global Game Hub Server Running!'));
