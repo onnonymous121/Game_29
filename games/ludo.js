@@ -8,16 +8,17 @@
 const rm = require('../roomManager');
 
 const COLORS = ['Red', 'Blue', 'White', 'Green']; 
-const SAFE_ZONES = [0, 8, 13, 21, 26, 34, 39, 47]; // গ্লোবাল সেফ জোন ইনডেক্স
-const START_POSITIONS = { 0: 0, 1: 13, 2: 26, 3: 39 };
+// ── গ্লোবাল সেফ জোন (১ থেকে ৫২ এর ম্যাপ অনুযায়ী) ──
+const SAFE_ZONES = [1, 9, 14, 22, 27, 35, 40, 48]; 
+const START_POSITIONS = { 0: 1, 1: 14, 2: 27, 3: 40 };
 
 function newLudoState(playMode) {
   return {
     playMode: playMode, 
     turnIndex: 0,
-    pendingDice: [], // ছক্কার ক্ষেত্রে একাধিক ডাইস জমিয়ে রাখার জন্য
+    pendingDice: [], 
     consecutiveSixes: 0,
-    rollPhase: true, // true = ডাইস চালার সময়, false = গুটি চালার সময়
+    rollPhase: true, 
     winners: [],
     tokens: [
       [{ id: 0, pos: -1 }, { id: 1, pos: -1 }, { id: 2, pos: -1 }, { id: 3, pos: -1 }], 
@@ -35,7 +36,7 @@ function initGame(roomCode) {
   rm.broadcastToRoom(roomCode, { 
     type: 'GAME_EVENT', 
     event: 'GAME_STARTED', 
-    payload: { turnIndex: 0, playMode: room.playMode } 
+    payload: { turnIndex: 0, playMode: room.playMode, players: room.players } 
   });
   setTimeout(() => checkBotTurn(roomCode), 2000);
 }
@@ -51,76 +52,90 @@ function handleGameAction(roomCode, playerId, msg) {
 
   switch (msg.type) {
     case 'ROLL_DICE': rollDice(roomCode, senderIdx); break;
-    case 'MOVE_TOKEN': moveToken(roomCode, senderIdx, msg.tokenId, msg.diceValue); break;
+    case 'MOVE_TOKEN': moveToken(roomCode, senderIdx, msg.tokenId, msg.diceValue, msg.ownerIdx); break;
     case 'REQUEST_SYNC': syncGameState(roomCode, playerId, senderIdx); break;
   }
 }
 
-// ── নতুন: Valid Moves & Enemy/Safe Zone Prediction ──
+// ── গ্লোবাল পজিশন ক্যালকুলেটর (১ থেকে ৫২) ──
+function getGlobalPosition(playerIdx, relativePos) {
+  if (relativePos < 0 || relativePos > 50) return -1;
+  // 1-based indexing math
+  return ((START_POSITIONS[playerIdx] - 1 + relativePos) % 52) + 1;
+}
+
+// ── Valid Moves & Partner Token Logic ──
 function getValidMovesDetails(gs, playerIdx) {
   const details = [];
-  const tokens = gs.tokens[playerIdx];
+  
+  // নিজের এবং (টিম মোড হলে) পার্টনারের গুটিগুলোও চালার অপশনে যোগ করা
+  let indices = [playerIdx];
+  if (gs.playMode === 'team') {
+      indices.push((playerIdx + 2) % 4);
+  }
 
-  // যেসব ডাইস ভ্যালু পেন্ডিং আছে, সেগুলোর প্রতিটির জন্য চাল হিসাব করা হবে
   const uniqueDice = [...new Set(gs.pendingDice)];
 
-  tokens.forEach(t => {
-    uniqueDice.forEach(diceVal => {
-      let newPos = -1;
-      let isUnlock = false;
-      let isFinish = false;
-      let killVictimIdx = -1;
-      let isSafeZone = false;
-      let enemyDistance = -1;
+  indices.forEach(ownerIdx => {
+    const tokens = gs.tokens[ownerIdx];
+    tokens.forEach(t => {
+      uniqueDice.forEach(diceVal => {
+        let newPos = -1;
+        let isUnlock = false;
+        let isFinish = false;
+        let killVictimIdx = -1;
+        let isSafeZone = false;
+        let enemyDistance = -1;
 
-      if (t.pos === -1 && diceVal === 6) {
-        newPos = 0;
-        isUnlock = true;
-      } else if (t.pos !== -1 && (t.pos + diceVal) <= 57) {
-        newPos = t.pos + diceVal;
-        if (newPos === 57) isFinish = true;
-      }
+        if (t.pos === -1 && diceVal === 6) {
+          newPos = 0;
+          isUnlock = true;
+        } else if (t.pos !== -1 && (t.pos + diceVal) <= 57) {
+          newPos = t.pos + diceVal;
+          if (newPos === 57) isFinish = true;
+        }
 
-      if (newPos !== -1) {
-         if (newPos >= 0 && newPos <= 50) {
-           const globalPos = getGlobalPosition(playerIdx, newPos);
-           
-           if (SAFE_ZONES.includes(globalPos)) {
-             isSafeZone = true; // সেফ জোনে যাচ্ছে
-           } else {
-             const killDetails = checkAndCutTokenSimulation(gs, playerIdx, globalPos); 
-             if (killDetails) killVictimIdx = killDetails.victimIdx;
-           }
-         }
-         
-         // ── Next Enemy Prediction (১ থেকে ৬ ঘরের মধ্যে) ──
-         if (!isFinish) {
-             for(let i = 1; i <= 6; i++) {
-                 if (newPos + i <= 50) {
-                     let gPos = getGlobalPosition(playerIdx, newPos + i);
-                     if (!SAFE_ZONES.includes(gPos)) { // সেফ জোনে থাকলে শত্রু নয়
-                         let check = checkAndCutTokenSimulation(gs, playerIdx, gPos);
-                         if (check) {
-                             enemyDistance = i; // এত ঘর সামনে শত্রু আছে
-                             break;
-                         }
-                     }
-                 }
+        if (newPos !== -1) {
+           if (newPos >= 0 && newPos <= 50) {
+             const globalPos = getGlobalPosition(ownerIdx, newPos);
+             
+             if (SAFE_ZONES.includes(globalPos)) {
+               isSafeZone = true; 
+             } else {
+               const killDetails = checkAndCutTokenSimulation(gs, ownerIdx, globalPos); 
+               if (killDetails) killVictimIdx = killDetails.victimIdx;
              }
-         }
+           }
+           
+           if (!isFinish) {
+               for(let i = 1; i <= 6; i++) {
+                   if (newPos + i <= 50) {
+                       let gPos = getGlobalPosition(ownerIdx, newPos + i);
+                       if (!SAFE_ZONES.includes(gPos)) { 
+                           let check = checkAndCutTokenSimulation(gs, ownerIdx, gPos);
+                           if (check) {
+                               enemyDistance = i; 
+                               break;
+                           }
+                       }
+                   }
+               }
+           }
 
-         details.push({
-           tokenId: t.id,
-           diceValue: diceVal,
-           currentPos: t.pos,
-           newPos: newPos,
-           isUnlock: isUnlock,
-           isFinish: isFinish,
-           killVictimIdx: killVictimIdx,
-           isSafeZone: isSafeZone,
-           enemyDistance: enemyDistance
-         });
-      }
+           details.push({
+             ownerIdx: ownerIdx, // কার গুটি সেটা ট্র্যাক করা
+             tokenId: t.id,
+             diceValue: diceVal,
+             currentPos: t.pos,
+             newPos: newPos,
+             isUnlock: isUnlock,
+             isFinish: isFinish,
+             killVictimIdx: killVictimIdx,
+             isSafeZone: isSafeZone,
+             enemyDistance: enemyDistance
+           });
+        }
+      });
     });
   });
   return details;
@@ -129,7 +144,7 @@ function getValidMovesDetails(gs, playerIdx) {
 function checkAndCutTokenSimulation(gs, attackerIdx, globalPos) {
   for (let i = 0; i < 4; i++) {
     if (i === attackerIdx) continue;
-    if (gs.playMode === 'team' && (i % 2 === attackerIdx % 2)) continue;
+    if (gs.playMode === 'team' && (i % 2 === attackerIdx % 2)) continue; // টিমমেটকে কাটবে না
     for (let t of gs.tokens[i]) {
       if (t.pos >= 0 && t.pos <= 50) {
         if (getGlobalPosition(i, t.pos) === globalPos) return { victimIdx: i, tokenId: t.id };
@@ -139,7 +154,6 @@ function checkAndCutTokenSimulation(gs, attackerIdx, globalPos) {
   return null;
 }
 
-// ── Dice Stacking Logic (ছক্কার নিয়ম) ──
 function rollDice(roomCode, playerIdx) {
   const room = rm.rooms.get(roomCode);
   const gs = room.game;
@@ -153,10 +167,9 @@ function rollDice(roomCode, playerIdx) {
     gs.consecutiveSixes++;
   } else {
     gs.consecutiveSixes = 0;
-    gs.rollPhase = false; // ছক্কা না উঠলে রোল ফেজ শেষ, এখন চালের ফেজ
+    gs.rollPhase = false; 
   }
 
-  // পরপর তিনবার ছক্কা উঠলে চাল বাতিল
   if (gs.consecutiveSixes === 3) {
     gs.consecutiveSixes = 0;
     gs.pendingDice = [];
@@ -165,7 +178,7 @@ function rollDice(roomCode, playerIdx) {
       diceValue: 6, 
       pendingDice: [],
       playerIdx: playerIdx,
-      isCancelled: true, // চাল বাতিলের সংকেত
+      isCancelled: true, 
       rollPhase: gs.rollPhase,
       validMoves: [] 
     });
@@ -180,7 +193,7 @@ function rollDice(roomCode, playerIdx) {
 
   rm.gameEvent(roomCode, 'DICE_ROLLED', { 
     diceValue: diceVal, 
-    pendingDice: gs.pendingDice, // জমে থাকা ডাইস পাঠানো হচ্ছে
+    pendingDice: gs.pendingDice, 
     playerIdx: playerIdx,
     isCancelled: false,
     rollPhase: gs.rollPhase,
@@ -195,35 +208,37 @@ function rollDice(roomCode, playerIdx) {
         }, 1500);
       } else if (isBot(room, playerIdx)) {
         setTimeout(() => {
-          const move = validMovesDetails[0]; // বটের ডিফল্ট চাল
-          moveToken(roomCode, playerIdx, move.tokenId, move.diceValue);
+          const move = validMovesDetails[0]; 
+          moveToken(roomCode, playerIdx, move.tokenId, move.diceValue, move.ownerIdx);
         }, 1500);
       }
   } else {
-      // যদি ছক্কা ওঠে, তবে বটের ক্ষেত্রে অটোমেটিক আবার রোল করবে
       if (isBot(room, playerIdx)) {
          setTimeout(() => { rollDice(roomCode, playerIdx); }, 1500);
       }
   }
 }
 
-function moveToken(roomCode, playerIdx, tokenId, diceValue) {
+function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
   const room = rm.rooms.get(roomCode);
   const gs = room.game;
   
   if (gs.turnIndex !== playerIdx || gs.rollPhase || gs.pendingDice.length === 0) return;
 
+  if (ownerIdx === undefined) ownerIdx = playerIdx;
+  if (gs.playMode !== 'team' && ownerIdx !== playerIdx) return;
+  if (gs.playMode === 'team' && ownerIdx !== playerIdx && ownerIdx !== (playerIdx + 2) % 4) return;
+
   const validMoves = getValidMovesDetails(gs, playerIdx);
-  const move = validMoves.find(m => m.tokenId === tokenId && m.diceValue === diceValue);
+  const move = validMoves.find(m => m.ownerIdx === ownerIdx && m.tokenId === tokenId && m.diceValue === diceValue);
   if (!move) return;
 
-  // চাল দেওয়া ডাইসটি লিস্ট থেকে মুছে ফেলা
   const diceIndex = gs.pendingDice.indexOf(diceValue);
   if (diceIndex > -1) {
     gs.pendingDice.splice(diceIndex, 1);
   }
 
-  const token = gs.tokens[playerIdx].find(t => t.id === tokenId);
+  const token = gs.tokens[ownerIdx].find(t => t.id === tokenId);
   let eventType = 'TOKEN_MOVED';
   
   if (move.isUnlock) {
@@ -237,7 +252,7 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue) {
   let cutDetails = null;
   if (move.killVictimIdx !== -1) {
       cutDetails = { victimIdx: move.killVictimIdx, tokenId: -1 }; 
-      const globalPos = getGlobalPosition(playerIdx, move.newPos);
+      const globalPos = getGlobalPosition(ownerIdx, move.newPos);
       for (let t of gs.tokens[move.killVictimIdx]) {
           if (t.pos >= 0 && t.pos <= 50 && getGlobalPosition(move.killVictimIdx, t.pos) === globalPos) {
               t.pos = -1;
@@ -246,16 +261,15 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue) {
           }
       }
       eventType = 'TOKEN_CUT';
-      gs.rollPhase = true; // গুটি কাটলে আবার চালার সুযোগ পাবে
+      gs.rollPhase = true; 
   }
 
-  if (move.isFinish) gs.rollPhase = true; // ঘরে ঢুকালেও আবার চালার সুযোগ পাবে
+  if (move.isFinish) gs.rollPhase = true; 
 
-  // উইন কন্ডিশন চেক
-  if (checkWinCondition(gs, playerIdx)) {
-    if (!gs.winners.includes(playerIdx)) gs.winners.push(playerIdx);
+  if (checkWinCondition(gs, ownerIdx)) {
+    if (!gs.winners.includes(ownerIdx)) gs.winners.push(ownerIdx);
     if (gs.winners.length === 3 || (gs.playMode === 'team' && checkTeamWin(gs))) {
-       rm.gameEvent(roomCode, 'TOKEN_FINISHED', { playerIdx, tokenId, newPos: move.newPos, diceValue, cutDetails });
+       rm.gameEvent(roomCode, 'TOKEN_FINISHED', { playerIdx, ownerIdx, tokenId, newPos: move.newPos, diceValue, cutDetails });
        setTimeout(() => rm.gameEvent(roomCode, 'GAME_OVER', { winners: gs.winners }), 1000);
        return;
     }
@@ -268,6 +282,7 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue) {
 
   rm.gameEvent(roomCode, eventType, { 
       playerIdx, 
+      ownerIdx, 
       tokenId, 
       newPos: move.newPos, 
       diceValue, 
@@ -283,18 +298,12 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue) {
       if (isBot(room, playerIdx)) {
           setTimeout(() => {
               const nextMove = remainingMoves[0];
-              moveToken(roomCode, playerIdx, nextMove.tokenId, nextMove.diceValue);
+              moveToken(roomCode, playerIdx, nextMove.tokenId, nextMove.diceValue, nextMove.ownerIdx);
           }, 1500);
       }
   } else {
       setTimeout(() => changeTurn(roomCode), 1000);
   }
-}
-
-function getGlobalPosition(playerIdx, relativePos) {
-  if (relativePos < 0 || relativePos > 50) return -1;
-  const start = START_POSITIONS[playerIdx];
-  return (start + relativePos) % 52;
 }
 
 function changeTurn(roomCode) {
@@ -334,6 +343,7 @@ function syncGameState(roomCode, playerId, slot) {
     playMode: room.game.playMode,
     pendingDice: room.game.pendingDice,
     rollPhase: room.game.rollPhase,
+    players: room.players, // ইউজারের নাম ফ্রন্টএন্ডে পাঠানোর জন্য
     myPlayerIndex: slot
   }, playerId);
 }
