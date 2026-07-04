@@ -1,8 +1,7 @@
 /**
  * Universal Room Manager
  * =====================================================
- * এটি সমস্ত গেমের (Game 29, Ludo, CallBreak) রুম কন্ট্রোল করবে।
- * গেমের স্পেসিফিক লজিক নিজ নিজ মডিউলে (যেমন: games/game29.js) থাকবে।
+ * এটি সমস্ত গেমের (Game 29, Ludo, CallBreak) রুম কন্ট্রোল এবং সেন্ট্রাল ইকোনমি হ্যান্ডেল করবে।
  */
 
 'use strict';
@@ -10,6 +9,7 @@
 const express = require('express');
 const { WebSocket } = require('ws');
 const crypto = require('crypto');
+const User = require('./models/User'); // ── ডাটাবেস মডেল ইমপোর্ট করা হলো ──
 
 const router = express.Router();
 
@@ -20,7 +20,6 @@ const rooms = new Map();
 const connections = new Map();
 const playerConnections = new Map();
 
-// ── এক্সপোর্ট ── (যাতে গেম মডিউলগুলো রুম ডেটা এক্সেস করতে পারে)
 module.exports.rooms = rooms;
 module.exports.connections = connections;
 module.exports.playerConnections = playerConnections;
@@ -28,13 +27,12 @@ module.exports.playerConnections = playerConnections;
 // ============================================================
 // GAME MODULES REGISTRY
 // ============================================================
-// নতুন গেম আসলে শুধু এখানে রিকোয়ার করে অ্যাড করে দিলেই হবে।
 const game29Module = require('./games/game29');
+const ludoModule = require('./games/ludo'); // লুডোর ফাইল তৈরি হলে আনকমেন্ট করবেন
 
 const AVAILABLE_GAMES = {
   '29': game29Module,
-  // 'ludo': ludoModule, // ভবিষ্যতে যুক্ত হবে
-  // 'callbreak': callBreakModule 
+  'ludo': ludoModule, 
 };
 
 // ============================================================
@@ -84,9 +82,11 @@ function broadcastRoomUpdate(roomCode) {
     roomCode,
     room: {
       hostId: room.hostId, hostName: room.hostName,
-      status: room.status, type: room.type, gameType: room.gameType,
+      status: room.status, type: room.type, 
+      gameType: room.gameType, playMode: room.playMode, 
       allowAudience: room.allowAudience, sessionId: room.sessionId,
       players: room.players, requests: room.requests, audiences: room.audiences,
+      prizePool: room.prizePool || 0 // প্রাইজ পুল আপডেট
     },
   });
 }
@@ -102,6 +102,84 @@ module.exports.broadcastRoomUpdate = broadcastRoomUpdate;
 module.exports.gameEvent = gameEvent;
 
 // ============================================================
+// UNIVERSAL ECONOMY LOGIC (Dynamic Leveling & Entry Fee)
+// ============================================================
+
+function getFeeBasedOnLevel(level) {
+  if (level <= 20) return 150;        // Bronze
+  else if (level <= 40) return 200;   // Silver
+  else if (level <= 60) return 250;   // Gold
+  else if (level <= 80) return 300;   // Platinum
+  else if (level <= 100) return 350;  // Diamond
+  else return 400;                    // Master (max 120)
+}
+
+function calculateDynamicLevel(xp) {
+  // প্রতি 500 XP তে ১ লেভেল। লেভেল কখনোই 1 এর নিচে বা 120 এর উপরে যাবে না
+  return Math.min(120, Math.max(1, Math.floor(xp / 500) + 1));
+}
+
+// গেম মডিউল (২৯, লুডো) গেম শেষ হলে এই ফাংশনটি কল করবে
+async function resolveUniversalGame(roomCode, winnerSlotsArray) {
+  const room = rooms.get(roomCode);
+  if (!room) return;
+
+  const realPlayers = Object.keys(room.players).filter(pid => !room.players[pid].isBot);
+  const winners = [];
+  const losers = [];
+
+  // উইনার এবং লুজার আলাদা করা
+  for (let pid of realPlayers) {
+    if (winnerSlotsArray.includes(room.players[pid].slot)) {
+      winners.push(pid);
+    } else {
+      losers.push(pid);
+    }
+  }
+
+  // প্রাইজ পুল হিসাব (৫% সার্ভার ট্যাক্স)
+  const prizePool = room.prizePool || 0;
+  const rewardPerWinner = winners.length > 0 ? Math.floor((prizePool * 0.95) / winners.length) : 0;
+
+  const results = {};
+
+  // উইনারদের আপডেট (+XP, +Coins)
+  for (let pid of winners) {
+    const user = await User.findOne({ uid: pid });
+    if (user) {
+      user.coins += rewardPerWinner;
+      user.xp += 50;
+      user.level = calculateDynamicLevel(user.xp);
+      await user.save();
+      results[pid] = { status: 'win', coinsEarned: rewardPerWinner, newCoins: user.coins, newLevel: user.level, xpChange: '+50' };
+    }
+  }
+
+  // লুজারদের আপডেট (-XP)
+  for (let pid of losers) {
+    const user = await User.findOne({ uid: pid });
+    if (user) {
+      user.xp = Math.max(0, user.xp - 20); // XP কমবে
+      user.level = calculateDynamicLevel(user.xp);
+      await user.save();
+      results[pid] = { status: 'loss', coinsEarned: 0, newCoins: user.coins, newLevel: user.level, xpChange: '-20' };
+    }
+  }
+
+  room.status = 'WAITING';
+  room.prizePool = 0; // প্রাইজ পুল রিসেট
+  
+  // ক্লায়েন্টকে ফলাফল জানিয়ে দেওয়া
+  broadcastToRoom(roomCode, {
+    type: 'GAME_OVER_RESULTS',
+    results: results
+  });
+  broadcastRoomUpdate(roomCode);
+}
+
+module.exports.resolveUniversalGame = resolveUniversalGame;
+
+// ============================================================
 // HTTP REST API (Room CRUD & Lobby)
 // ============================================================
 
@@ -109,14 +187,13 @@ router.get('/health', (req, res) => {
   res.json({ status: 'ok', rooms: rooms.size, connections: connections.size, uptime: Math.floor(process.uptime()) });
 });
 
-// পাবলিক রুম লিস্ট (ফিল্টার অপশন সহ)
 router.get('/rooms', (req, res) => {
   const list = [];
-  const { gameType } = req.query; // ফ্রন্টএন্ড থেকে gameType ফিল্টার আসবে
+  const { gameType } = req.query; 
 
   rooms.forEach((room, code) => {
     if (room.type !== 'public') return;
-    if (gameType && room.gameType !== gameType && gameType !== 'all') return; // ফিল্টারিং
+    if (gameType && room.gameType !== gameType && gameType !== 'all') return; 
 
     const playerCount = Object.keys(room.players).length;
     const canJoin = (room.status === 'WAITING' && (playerCount < 4 || room.allowAudience))
@@ -129,7 +206,8 @@ router.get('/rooms', (req, res) => {
         playerCount, 
         allowsAudience: room.allowAudience, 
         status: room.status,
-        gameType: room.gameType 
+        gameType: room.gameType,
+        playMode: room.playMode
       });
     }
   });
@@ -142,35 +220,37 @@ router.get('/rooms/:code', (req, res) => {
   res.json({
     code: req.params.code, hostId: room.hostId, hostName: room.hostName,
     status: room.status, type: room.type, allowAudience: room.allowAudience,
-    gameType: room.gameType, sessionId: room.sessionId, 
+    gameType: room.gameType, playMode: room.playMode, sessionId: room.sessionId, 
     playerCount: Object.keys(room.players).length,
     players: room.players, requests: room.requests, audiences: room.audiences,
   });
 });
 
 router.post('/rooms/create', (req, res) => {
-  const { playerId, playerName, type, allowAudience, gameType } = req.body;
+  const { playerId, playerName, type, allowAudience, gameType, playMode } = req.body;
   if (!playerId || !playerName) return res.status(400).json({ error: 'playerId and playerName required' });
 
-  // ক্লিনআপ: একই ইউজারের অন্য কোনো রুম থাকলে ডিলিট করে দেওয়া
   rooms.forEach((r, code) => { if (r.hostId === playerId) rooms.delete(code); });
 
   const roomCode = generateRoomCode();
-  const finalGameType = gameType || '29'; // বাই ডিফল্ট 29 
+  const finalGameType = gameType || '29'; 
+  const finalPlayMode = playMode || (finalGameType === '29' ? 'team' : 'individual'); 
 
   rooms.set(roomCode, {
     hostId: playerId, hostName: playerName,
     status: 'WAITING',
     type: type === 'private' ? 'private' : 'public',
     gameType: finalGameType, 
+    playMode: finalPlayMode,
     allowAudience: allowAudience !== false,
     sessionId: null, createdAt: Date.now(),
     players: { [playerId]: { name: playerName, slot: 0, isBot: false } },
     requests: {}, audiences: {},
     game: null,
     disconnectedPlayers: {},
+    prizePool: 0, // প্রাইজ পুল যোগ করা হলো
   });
-  res.json({ success: true, roomCode, gameType: finalGameType });
+  res.json({ success: true, roomCode, gameType: finalGameType, playMode: finalPlayMode });
 });
 
 router.post('/rooms/:code/join', (req, res) => {
@@ -180,7 +260,6 @@ router.post('/rooms/:code/join', (req, res) => {
   const room = rooms.get(req.params.code);
   if (!room) return res.status(404).json({ error: 'Room not found' });
 
-  // Seat Recovery
   if (room.disconnectedPlayers && room.disconnectedPlayers[playerId]) {
     const oldData = room.disconnectedPlayers[playerId];
     if (room.players[`BOT_${oldData.slot}`]) {
@@ -190,7 +269,7 @@ router.post('/rooms/:code/join', (req, res) => {
       broadcastRoomUpdate(req.params.code);
       gameEvent(req.params.code, 'CHAT', { sender: 'SERVER', message: `${playerName} rejoined the game and took back their seat.` });
       gameEvent(req.params.code, 'PLAYER_REJOINED', { playerId, slot: oldData.slot, playerName });
-      return res.json({ role: 'player', reason: 'rejoined', gameType: room.gameType });
+      return res.json({ role: 'player', reason: 'rejoined', gameType: room.gameType, playMode: room.playMode });
     }
   }
 
@@ -198,26 +277,26 @@ router.post('/rooms/:code/join', (req, res) => {
     if (!room.allowAudience) return res.status(403).json({ error: 'Audience not allowed' });
     room.audiences[playerId] = { name: playerName };
     broadcastRoomUpdate(req.params.code);
-    return res.json({ role: 'audience', gameType: room.gameType });
+    return res.json({ role: 'audience', gameType: room.gameType, playMode: room.playMode });
   }
 
   if (room.status === 'PLAYING') {
     if (!room.allowAudience) return res.status(403).json({ error: 'Game in progress' });
     room.audiences[playerId] = { name: playerName };
     broadcastRoomUpdate(req.params.code);
-    return res.json({ role: 'audience', reason: 'game_started', gameType: room.gameType });
+    return res.json({ role: 'audience', reason: 'game_started', gameType: room.gameType, playMode: room.playMode });
   }
 
   if (Object.keys(room.players).length >= 4) {
     if (!room.allowAudience) return res.status(403).json({ error: 'Room full' });
     room.audiences[playerId] = { name: playerName };
     broadcastRoomUpdate(req.params.code);
-    return res.json({ role: 'audience', reason: 'room_full', gameType: room.gameType });
+    return res.json({ role: 'audience', reason: 'room_full', gameType: room.gameType, playMode: room.playMode });
   }
 
   room.requests[playerId] = { name: playerName };
   broadcastRoomUpdate(req.params.code);
-  res.json({ role: 'requested', gameType: room.gameType });
+  res.json({ role: 'requested', gameType: room.gameType, playMode: room.playMode });
 });
 
 router.post('/rooms/:code/admit', (req, res) => {
@@ -251,13 +330,47 @@ router.post('/rooms/:code/reject', (req, res) => {
   res.json({ success: true });
 });
 
-router.post('/rooms/:code/start', (req, res) => {
+// ── START GAME: ENTRY FEE DEDUCTION LOGIC ──
+router.post('/rooms/:code/start', async (req, res) => {
   const { hostId, sessionId } = req.body;
   const room = rooms.get(req.params.code);
+  
   if (!room) return res.status(404).json({ error: 'Room not found' });
   if (room.hostId !== hostId) return res.status(403).json({ error: 'Not the host' });
 
-  // ফিল বটস
+  // ১. সকল রিয়েল প্লেয়ার ফিল্টার করা (অডিয়েন্স ও বট বাদ দিয়ে)
+  const realPlayers = Object.keys(room.players).filter(pid => !room.players[pid].isBot);
+  let totalPrizePool = 0;
+  const playerUpdates = [];
+
+  // ২. ব্যালেন্স চেক এবং ফি ক্যালকুলেশন
+  for (let pid of realPlayers) {
+    const user = await User.findOne({ uid: pid });
+    if (!user) continue;
+    
+    const level = user.level || 1;
+    const requiredFee = getFeeBasedOnLevel(level);
+
+    if (user.coins < requiredFee) {
+      return res.status(400).json({ 
+        error: `Insufficient coins for player: ${room.players[pid].name}. Need ${requiredFee} coins.`,
+        errorCode: 'INSUFFICIENT_COINS' 
+      });
+    }
+
+    playerUpdates.push({ user, fee: requiredFee });
+  }
+
+  // ৩. সবার ব্যালেন্স ঠিক থাকলে কয়েন কাটা হবে
+  for (let { user, fee } of playerUpdates) {
+    user.coins -= fee;
+    await user.save();
+    totalPrizePool += fee;
+  }
+
+  room.prizePool = totalPrizePool; // গেম শেষের জন্য প্রাইজ পুল সেভ করা হলো
+
+  // ৪. খালি স্লটে বট বসিয়ে গেম শুরু
   for (let i = 0; i < 4; i++) {
     const occupied = Object.values(room.players).map(p => p.slot);
     if (!occupied.includes(i)) {
@@ -270,7 +383,6 @@ router.post('/rooms/:code/start', (req, res) => {
   room.status = 'PLAYING';
   broadcastRoomUpdate(req.params.code);
 
-  // ── নির্দিষ্ট গেমের ইনিশিয়ালাইজার কল করা ──
   const gameModule = AVAILABLE_GAMES[room.gameType];
   if (gameModule && gameModule.initGame) {
     gameModule.initGame(req.params.code);
@@ -296,7 +408,6 @@ router.delete('/rooms/:code', (req, res) => {
   res.json({ success: true });
 });
 
-// ── লবির অন্যান্য ফাংশন ──
 router.post('/rooms/:code/bot', (req, res) => {
   const { hostId, slot, action } = req.body;
   const room = rooms.get(req.params.code);
@@ -355,7 +466,6 @@ router.post('/rooms/:code/promote', (req, res) => {
   broadcastRoomUpdate(req.params.code);
   gameEvent(req.params.code, 'CHAT', { sender: 'SERVER', message: `${audienceName} replaced Bot in Slot ${targetSlot + 1}` });
 
-  // Sync state for promoted audience will be handled by the game module
   const gameModule = AVAILABLE_GAMES[room.gameType];
   if (gameModule && gameModule.syncPromotedAudience) {
       gameModule.syncPromotedAudience(req.params.code, audienceId, targetSlot);
@@ -402,7 +512,6 @@ function handleWsMessage(socketId, msg) {
   const conn = connections.get(socketId);
   if (!conn) return;
 
-  // ── সাধারণ গ্লোবাল ইভেন্ট ──
   switch (msg.type) {
     case 'REGISTER': {
       const { playerId, roomCode, isAudience } = msg;
@@ -453,10 +562,8 @@ function handleWsMessage(socketId, msg) {
     }
   }
 
-  // ── গেম-স্পেসিফিক ইভেন্ট ──
   const room = rooms.get(conn.roomCode);
   if (room && AVAILABLE_GAMES[room.gameType]) {
-    // নির্দিষ্ট গেমের মডিউলের কাছে রিকোয়েস্ট পাঠিয়ে দেওয়া হলো
     AVAILABLE_GAMES[room.gameType].handleGameAction(conn.roomCode, conn.playerId, msg);
   }
 }
@@ -479,7 +586,6 @@ function handleDisconnect(socketId) {
         broadcastRoomUpdate(roomCode);
       } else if (room.hostId === playerId) {
         
-        // ── HOST MIGRATION ──
         const oldHostSlot = getSlotIndex(room, playerId);
         let newHostId = null;
 
@@ -531,7 +637,6 @@ function handleDisconnect(socketId) {
                 broadcastRoomUpdate(roomCode);
                 gameEvent(roomCode, 'CHAT', { sender: 'SERVER', message: `${pName} disconnected. Bot took over Slot ${s + 1}.` });
 
-                // ── গেম স্পেসিফিক ডিসকানেক্ট লজিক কল করা ──
                 const gameModule = AVAILABLE_GAMES[room.gameType];
                 if (gameModule && gameModule.handlePlayerDisconnectDuringGame) {
                     gameModule.handlePlayerDisconnectDuringGame(roomCode, s);
