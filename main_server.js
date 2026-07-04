@@ -13,7 +13,7 @@ const serviceAccount = require('./serviceAccountKey.json');
 initializeApp({ credential: cert(serviceAccount) });
 
 const User = require('./models/User');
-const game29Module = require('./games/game29');
+const roomManager = require('./roomManager'); // ── নতুন সেন্ট্রাল রুম ম্যানেজার ──
 
 const app = express();
 app.use(express.json());
@@ -32,8 +32,9 @@ const wss = new WebSocketServer({ noServer: true });
 httpServer.on('upgrade', (request, socket, head) => {
   const { pathname } = parse(request.url);
   wss.handleUpgrade(request, socket, head, (ws) => {
-    if (pathname === '/ws/game29') {
-      game29Module.handleConnection(ws);
+    // ── গ্লোবাল ওয়েবসকেট রাউটিং ──
+    if (pathname === '/ws/game29' || pathname === '/ws/games') {
+      roomManager.handleConnection(ws);
     } else {
       ws.close();
     }
@@ -94,18 +95,16 @@ app.post('/api/update-name', async (req, res) => {
   }
 });
 
-// ── নতুন API: রিওয়ার্ড অ্যাড দেখে কয়েন অর্জন ──
 app.post('/api/reward-coins', async (req, res) => {
   const { uid } = req.body;
   try {
     const user = await User.findOne({ uid });
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    const DAILY_AD_LIMIT = 10; // প্রতিদিন সর্বোচ্চ ১০টি অ্যাড
-    const REWARD_COINS = 250;  // প্রতি অ্যাডে ২৫০ কয়েন
+    const DAILY_AD_LIMIT = 10; 
+    const REWARD_COINS = 250;  
     const now = new Date();
 
-    // নতুন দিন শুরু হলে অ্যাডের কাউন্ট রিসেট করা
     if (user.lastAdDate) {
       const lastDate = new Date(user.lastAdDate);
       if (lastDate.toDateString() !== now.toDateString()) {
@@ -113,12 +112,10 @@ app.post('/api/reward-coins', async (req, res) => {
       }
     }
 
-    // লিমিট চেক করা
     if (user.dailyAdCount >= DAILY_AD_LIMIT) {
       return res.status(400).json({ error: 'Daily ad limit reached. Come back tomorrow!' });
     }
 
-    // কয়েন আপডেট করা
     user.coins += REWARD_COINS;
     user.dailyAdCount += 1;
     user.lastAdDate = now;
@@ -135,7 +132,8 @@ app.post('/api/reward-coins', async (req, res) => {
   }
 });
 
-app.use('/game29', game29Module.router);
+// ফ্রন্টএন্ডের সুবিধার জন্য পুরনো পাথ /game29 তেই রাউটারটি মাউন্ট করা হলো
+app.use('/game29', roomManager.router);
 
 app.get('/', (req, res) => res.send('Global Game Hub Server Running!'));
 app.get('/health', (req, res) => res.json({ status: 'ok' }));

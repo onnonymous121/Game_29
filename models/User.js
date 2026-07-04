@@ -17,6 +17,16 @@ const userSchema = new mongoose.Schema({
     matchesPlayed: { type: Number, default: 0 },
     wins: { type: Number, default: 0 }
   },
+  // ── নতুন গেমগুলোর স্ট্যাটাস ──
+  ludoStats: {
+    matchesPlayed: { type: Number, default: 0 },
+    wins: { type: Number, default: 0 }
+  },
+  callBreakStats: {
+    matchesPlayed: { type: Number, default: 0 },
+    wins: { type: Number, default: 0 }
+  },
+  
   createdAt: { type: Date, default: Date.now }
 });
 
