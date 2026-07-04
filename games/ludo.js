@@ -15,7 +15,7 @@ function newLudoState(playMode) {
   return {
     playMode: playMode, 
     turnIndex: 0,
-    turnStartTime: Date.now(), // ── টাইমার ট্র্যাকিংয়ের জন্য
+    turnStartTime: Date.now(), 
     pendingDice: [], 
     consecutiveSixes: 0,
     rollPhase: true, 
@@ -29,13 +29,13 @@ function newLudoState(playMode) {
   };
 }
 
-// ── TURN TIMER LOGIC (40 Seconds Auto Skip) ──
+// ── TURN TIMER & AUDIO SYNC LOGIC ──
 const turnTimers = new Map();
+const audioFallbackTimers = new Map(); // অডিও আটকে গেলে ফলব্যাক টাইমার
 
 function startTurnTimer(roomCode) {
-  if (turnTimers.has(roomCode)) {
-    clearTimeout(turnTimers.get(roomCode));
-  }
+  if (turnTimers.has(roomCode)) clearTimeout(turnTimers.get(roomCode));
+  
   const room = rm.rooms.get(roomCode);
   if (room && room.game) {
     room.game.turnStartTime = Date.now();
@@ -44,6 +44,26 @@ function startTurnTimer(roomCode) {
     handleTurnTimeout(roomCode);
   }, 40000); // 40 seconds
   turnTimers.set(roomCode, timer);
+}
+
+function pauseTimerAndWaitForAudio(roomCode) {
+  if (turnTimers.has(roomCode)) clearTimeout(turnTimers.get(roomCode));
+  if (audioFallbackTimers.has(roomCode)) clearTimeout(audioFallbackTimers.get(roomCode));
+  
+  const room = rm.rooms.get(roomCode);
+  if(!room || !room.game) return;
+  
+  if (isBot(room, room.game.turnIndex)) {
+      // বট হলে অডিও ডানের অপেক্ষা নেই, সাথে সাথে টাইমার শুরু
+      startTurnTimer(roomCode);
+      rm.gameEvent(roomCode, 'TIMER_STARTED', { turnStartTime: room.game.turnStartTime });
+  } else {
+      // মানুষের ক্ষেত্রে ৬ সেকেন্ডের ফলব্যাক (যদি অডিও শেষ সিগন্যাল না আসে)
+      audioFallbackTimers.set(roomCode, setTimeout(() => {
+          startTurnTimer(roomCode);
+          rm.gameEvent(roomCode, 'TIMER_STARTED', { turnStartTime: room.game.turnStartTime });
+      }, 6000));
+  }
 }
 
 function handleTurnTimeout(roomCode) {
@@ -60,7 +80,6 @@ function initGame(roomCode) {
   if (!room) return;
   room.game = newLudoState(room.playMode); 
   
-  // Bot Numbering
   let botCount = 1;
   Object.keys(room.players).forEach(pid => {
       if (room.players[pid].isBot) {
@@ -69,13 +88,13 @@ function initGame(roomCode) {
       }
   });
 
+  pauseTimerAndWaitForAudio(roomCode);
   rm.broadcastToRoom(roomCode, { 
     type: 'GAME_EVENT', 
     event: 'GAME_STARTED', 
-    payload: { turnIndex: 0, playMode: room.playMode, players: room.players, turnStartTime: room.game.turnStartTime } 
+    payload: { turnIndex: 0, playMode: room.playMode, players: room.players } 
   });
   
-  startTurnTimer(roomCode);
   setTimeout(() => checkBotTurn(roomCode), 2000);
 }
 
@@ -92,6 +111,14 @@ function handleGameAction(roomCode, playerId, msg) {
     case 'ROLL_DICE': rollDice(roomCode, senderIdx); break;
     case 'MOVE_TOKEN': moveToken(roomCode, senderIdx, msg.tokenId, msg.diceValue, msg.ownerIdx); break;
     case 'REQUEST_SYNC': syncGameState(roomCode, playerId, senderIdx); break;
+    case 'AUDIO_DONE': 
+      // ক্লায়েন্ট অডিও বলা শেষ করলে টাইমার স্টার্ট হবে
+      if (senderIdx === room.game.turnIndex) {
+          if (audioFallbackTimers.has(roomCode)) clearTimeout(audioFallbackTimers.get(roomCode));
+          startTurnTimer(roomCode);
+          rm.gameEvent(roomCode, 'TIMER_STARTED', { turnStartTime: room.game.turnStartTime });
+      }
+      break;
   }
 }
 
@@ -103,9 +130,7 @@ function getGlobalPosition(playerIdx, relativePos) {
 function getValidMovesDetails(gs, playerIdx) {
   const details = [];
   let indices = [playerIdx];
-  if (gs.playMode === 'team') {
-      indices.push((playerIdx + 2) % 4);
-  }
+  if (gs.playMode === 'team') indices.push((playerIdx + 2) % 4);
 
   const uniqueDice = [...new Set(gs.pendingDice)];
 
@@ -131,7 +156,6 @@ function getValidMovesDetails(gs, playerIdx) {
         if (newPos !== -1) {
            if (newPos >= 0 && newPos <= 50) {
              const globalPos = getGlobalPosition(ownerIdx, newPos);
-             
              if (SAFE_ZONES.includes(globalPos)) {
                isSafeZone = true; 
              } else {
@@ -193,9 +217,6 @@ function rollDice(roomCode, playerIdx) {
 
   if (gs.turnIndex !== playerIdx || !gs.rollPhase) return;
 
-  // ডাইস রোল হলে টাইমার রিস্টার্ট
-  startTurnTimer(roomCode);
-
   const diceVal = Math.floor(Math.random() * 6) + 1; 
   gs.pendingDice.push(diceVal);
 
@@ -205,6 +226,8 @@ function rollDice(roomCode, playerIdx) {
     gs.consecutiveSixes = 0;
     gs.rollPhase = false; 
   }
+
+  pauseTimerAndWaitForAudio(roomCode);
 
   if (gs.consecutiveSixes === 3) {
     gs.consecutiveSixes = 0;
@@ -248,7 +271,6 @@ function rollDice(roomCode, playerIdx) {
           moveToken(roomCode, playerIdx, move.tokenId, move.diceValue, move.ownerIdx);
         }, 1500);
       } else if (validMovesDetails.length === 1) {
-        // ── AUTO MOVE: যদি মানুষের জন্য ১টি মাত্র চাল থাকে ──
         setTimeout(() => {
           const m = validMovesDetails[0];
           moveToken(roomCode, playerIdx, m.tokenId, m.diceValue, m.ownerIdx);
@@ -274,9 +296,6 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
   const validMoves = getValidMovesDetails(gs, playerIdx);
   const move = validMoves.find(m => m.ownerIdx === ownerIdx && m.tokenId === tokenId && m.diceValue === diceValue);
   if (!move) return;
-
-  // মুভ হলে টাইমার রিস্টার্ট
-  startTurnTimer(roomCode);
 
   const diceIndex = gs.pendingDice.indexOf(diceValue);
   if (diceIndex > -1) {
@@ -321,6 +340,8 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
     }
   }
 
+  pauseTimerAndWaitForAudio(roomCode);
+
   let remainingMoves = [];
   if (!gs.rollPhase && gs.pendingDice.length > 0) {
       remainingMoves = getValidMovesDetails(gs, playerIdx);
@@ -347,7 +368,6 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
               moveToken(roomCode, playerIdx, nextMove.tokenId, nextMove.diceValue, nextMove.ownerIdx);
           }, 1500);
       } else if (remainingMoves.length === 1) {
-          // ── AUTO MOVE ──
           setTimeout(() => {
             const nextMove = remainingMoves[0];
             moveToken(roomCode, playerIdx, nextMove.tokenId, nextMove.diceValue, nextMove.ownerIdx);
@@ -366,8 +386,8 @@ function changeTurn(roomCode) {
   gs.rollPhase = true; 
   do { gs.turnIndex = (gs.turnIndex + 1) % 4; } while (gs.winners.includes(gs.turnIndex));
   
-  startTurnTimer(roomCode); // নতুন টার্নের জন্য টাইমার
-  rm.gameEvent(roomCode, 'TURN_CHANGED', { turnIndex: gs.turnIndex, turnStartTime: gs.turnStartTime });
+  pauseTimerAndWaitForAudio(roomCode);
+  rm.gameEvent(roomCode, 'TURN_CHANGED', { turnIndex: gs.turnIndex });
   checkBotTurn(roomCode);
 }
 
