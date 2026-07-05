@@ -31,7 +31,7 @@ function newLudoState(playMode) {
 
 // ── TURN TIMER & AUDIO SYNC LOGIC ──
 const turnTimers = new Map();
-const audioFallbackTimers = new Map(); // অডিও আটকে গেলে ফলব্যাক টাইমার
+const audioFallbackTimers = new Map(); 
 
 function startTurnTimer(roomCode) {
   if (turnTimers.has(roomCode)) clearTimeout(turnTimers.get(roomCode));
@@ -42,7 +42,7 @@ function startTurnTimer(roomCode) {
   }
   const timer = setTimeout(() => {
     handleTurnTimeout(roomCode);
-  }, 40000); // 40 seconds
+  }, 40000); 
   turnTimers.set(roomCode, timer);
 }
 
@@ -54,11 +54,9 @@ function pauseTimerAndWaitForAudio(roomCode) {
   if(!room || !room.game) return;
   
   if (isBot(room, room.game.turnIndex)) {
-      // বট হলে অডিও ডানের অপেক্ষা নেই, সাথে সাথে টাইমার শুরু
       startTurnTimer(roomCode);
       rm.gameEvent(roomCode, 'TIMER_STARTED', { turnStartTime: room.game.turnStartTime });
   } else {
-      // মানুষের ক্ষেত্রে ৬ সেকেন্ডের ফলব্যাক (যদি অডিও শেষ সিগন্যাল না আসে)
       audioFallbackTimers.set(roomCode, setTimeout(() => {
           startTurnTimer(roomCode);
           rm.gameEvent(roomCode, 'TIMER_STARTED', { turnStartTime: room.game.turnStartTime });
@@ -92,7 +90,13 @@ function initGame(roomCode) {
   rm.broadcastToRoom(roomCode, { 
     type: 'GAME_EVENT', 
     event: 'GAME_STARTED', 
-    payload: { turnIndex: 0, playMode: room.playMode, players: room.players } 
+    payload: { 
+        turnIndex: 0, 
+        playMode: room.playMode, 
+        players: room.players,
+        expectedAction: 'ROLL',
+        actionPlayerIdx: 0
+    } 
   });
   
   setTimeout(() => checkBotTurn(roomCode), 2000);
@@ -112,7 +116,6 @@ function handleGameAction(roomCode, playerId, msg) {
     case 'MOVE_TOKEN': moveToken(roomCode, senderIdx, msg.tokenId, msg.diceValue, msg.ownerIdx); break;
     case 'REQUEST_SYNC': syncGameState(roomCode, playerId, senderIdx); break;
     case 'AUDIO_DONE': 
-      // ক্লায়েন্ট অডিও বলা শেষ করলে টাইমার স্টার্ট হবে
       if (senderIdx === room.game.turnIndex) {
           if (audioFallbackTimers.has(roomCode)) clearTimeout(audioFallbackTimers.get(roomCode));
           startTurnTimer(roomCode);
@@ -143,7 +146,7 @@ function getValidMovesDetails(gs, playerIdx) {
         let isFinish = false;
         let killVictimIdx = -1;
         let isSafeZone = false;
-        let enemyDistance = -1;
+        let enemiesAhead = [];
 
         if (t.pos === -1 && diceVal === 6) {
           newPos = 0;
@@ -170,10 +173,7 @@ function getValidMovesDetails(gs, playerIdx) {
                        let gPos = getGlobalPosition(ownerIdx, newPos + i);
                        if (!SAFE_ZONES.includes(gPos)) { 
                            let check = checkAndCutTokenSimulation(gs, ownerIdx, gPos);
-                           if (check) {
-                               enemyDistance = i; 
-                               break;
-                           }
+                           if (check) enemiesAhead.push(i);
                        }
                    }
                }
@@ -189,7 +189,7 @@ function getValidMovesDetails(gs, playerIdx) {
              isFinish: isFinish,
              killVictimIdx: killVictimIdx,
              isSafeZone: isSafeZone,
-             enemyDistance: enemyDistance
+             enemiesAhead: enemiesAhead
            });
         }
       });
@@ -239,7 +239,9 @@ function rollDice(roomCode, playerIdx) {
       playerIdx: playerIdx,
       isCancelled: true, 
       rollPhase: gs.rollPhase,
-      validMoves: [] 
+      validMoves: [],
+      expectedAction: 'NONE',
+      actionPlayerIdx: playerIdx
     });
     setTimeout(() => changeTurn(roomCode), 1500);
     return;
@@ -250,13 +252,19 @@ function rollDice(roomCode, playerIdx) {
       validMovesDetails = getValidMovesDetails(gs, playerIdx);
   }
 
+  let expectedAction = 'NONE';
+  if (gs.rollPhase) expectedAction = 'ROLL';
+  else if (validMovesDetails.length > 0) expectedAction = 'MOVE';
+
   rm.gameEvent(roomCode, 'DICE_ROLLED', { 
     diceValue: diceVal, 
     pendingDice: gs.pendingDice, 
     playerIdx: playerIdx,
     isCancelled: false,
     rollPhase: gs.rollPhase,
-    validMoves: validMovesDetails 
+    validMoves: validMovesDetails,
+    expectedAction: expectedAction,
+    actionPlayerIdx: playerIdx
   });
 
   if (!gs.rollPhase) {
@@ -270,11 +278,6 @@ function rollDice(roomCode, playerIdx) {
           const move = validMovesDetails[0]; 
           moveToken(roomCode, playerIdx, move.tokenId, move.diceValue, move.ownerIdx);
         }, 1500);
-      } else if (validMovesDetails.length === 1) {
-        setTimeout(() => {
-          const m = validMovesDetails[0];
-          moveToken(roomCode, playerIdx, m.tokenId, m.diceValue, m.ownerIdx);
-        }, 1200);
       }
   } else {
       if (isBot(room, playerIdx)) {
@@ -347,6 +350,10 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
       remainingMoves = getValidMovesDetails(gs, playerIdx);
   }
 
+  let expectedAction = 'NONE';
+  if (gs.rollPhase) expectedAction = 'ROLL';
+  else if (remainingMoves.length > 0) expectedAction = 'MOVE';
+
   rm.gameEvent(roomCode, eventType, { 
       playerIdx, 
       ownerIdx, 
@@ -356,7 +363,9 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
       cutDetails,
       pendingDice: gs.pendingDice,
       rollPhase: gs.rollPhase,
-      validMoves: remainingMoves
+      validMoves: remainingMoves,
+      expectedAction: expectedAction,
+      actionPlayerIdx: playerIdx
   });
 
   if (gs.rollPhase) {
@@ -367,11 +376,6 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
               const nextMove = remainingMoves[0];
               moveToken(roomCode, playerIdx, nextMove.tokenId, nextMove.diceValue, nextMove.ownerIdx);
           }, 1500);
-      } else if (remainingMoves.length === 1) {
-          setTimeout(() => {
-            const nextMove = remainingMoves[0];
-            moveToken(roomCode, playerIdx, nextMove.tokenId, nextMove.diceValue, nextMove.ownerIdx);
-          }, 1200);
       }
   } else {
       setTimeout(() => changeTurn(roomCode), 1000);
@@ -387,7 +391,11 @@ function changeTurn(roomCode) {
   do { gs.turnIndex = (gs.turnIndex + 1) % 4; } while (gs.winners.includes(gs.turnIndex));
   
   pauseTimerAndWaitForAudio(roomCode);
-  rm.gameEvent(roomCode, 'TURN_CHANGED', { turnIndex: gs.turnIndex });
+  rm.gameEvent(roomCode, 'TURN_CHANGED', { 
+      turnIndex: gs.turnIndex,
+      expectedAction: 'ROLL',
+      actionPlayerIdx: gs.turnIndex
+  });
   checkBotTurn(roomCode);
 }
 
@@ -419,7 +427,9 @@ function syncGameState(roomCode, playerId, slot) {
     pendingDice: room.game.pendingDice,
     rollPhase: room.game.rollPhase,
     players: room.players, 
-    myPlayerIndex: slot
+    myPlayerIndex: slot,
+    expectedAction: room.game.rollPhase ? 'ROLL' : 'MOVE',
+    actionPlayerIdx: room.game.turnIndex
   }, playerId);
 }
 
