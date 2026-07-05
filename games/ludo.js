@@ -20,8 +20,8 @@ function newLudoState(playMode) {
     consecutiveSixes: 0,
     rollPhase: true, 
     winners: [],
-    isWaitingForAudio: false, // সিঙ্ক্রোনাইজেশনের জন্য নতুন স্টেট
-    pendingAction: null,      // অডিও শেষ হলে সার্ভার যে ফাংশনটি রান করবে
+    isWaitingForAudio: false, 
+    pendingAction: null,      
     actionTimer: null,
     tokens: [
       [{ id: 0, pos: -1 }, { id: 1, pos: -1 }, { id: 2, pos: -1 }, { id: 3, pos: -1 }], 
@@ -57,7 +57,6 @@ function handleTurnTimeout(roomCode) {
   changeTurn(roomCode);
 }
 
-// ফ্রন্টএন্ডে অডিও শেষ হওয়ার জন্য স্টেট প্রস্তুত করা
 function prepareStateForAudio(roomCode, pendingActionFn) {
   const room = rm.rooms.get(roomCode);
   if (!room || !room.game) return;
@@ -68,7 +67,7 @@ function prepareStateForAudio(roomCode, pendingActionFn) {
   room.game.isWaitingForAudio = true;
   room.game.pendingAction = pendingActionFn || null;
   
-  // সেফটি ফলব্যাক: ক্লায়েন্ট যদি কোনো কারণে ডিসকানেক্ট হয়ে যায়, তবে ৬ সেকেন্ড পর অটোমেটিক গেম এগিয়ে যাবে
+  // সেফটি ফলব্যাক
   room.game.actionTimer = setTimeout(() => {
       forceAudioDone(roomCode);
   }, 6000);
@@ -92,7 +91,6 @@ function forceAudioDone(roomCode) {
       room.game.pendingAction = null;
       fn(); 
   } else {
-      // যদি সার্ভারের কোনো পেন্ডিং অ্যাকশন না থাকে, মানে মানুষের চালের পালা
       if (isBot(room, room.game.turnIndex)) {
           checkBotTurn(roomCode);
       } else {
@@ -149,7 +147,6 @@ function handleGameAction(roomCode, playerId, msg) {
     case 'REQUEST_SYNC': syncGameState(roomCode, playerId, senderIdx); break;
     case 'AUDIO_DONE': 
       const isBotTurn = isBot(room, room.game.turnIndex);
-      // শুধুমাত্র যার চাল সে, অথবা যদি বটের চাল হয় তাহলে হোষ্ট (Slot 0) এই সিগন্যালটি ট্রিগার করতে পারবে
       if (senderIdx === room.game.turnIndex || (isBotTurn && senderIdx === 0)) {
           handleAudioDoneSignal(roomCode);
       }
@@ -266,7 +263,6 @@ function rollDice(roomCode, playerIdx) {
     gs.pendingDice = [];
     gs.rollPhase = false;
     
-    // ৩টি ছক্কা পড়লে অডিও শেষে টার্ন চেঞ্জ হবে
     prepareStateForAudio(roomCode, () => changeTurn(roomCode));
 
     rm.gameEvent(roomCode, 'DICE_ROLLED', { 
@@ -293,17 +289,19 @@ function rollDice(roomCode, playerIdx) {
   if (gs.rollPhase) {
       expectedAction = 'ROLL';
       if (isBot(room, playerIdx)) pendingAction = () => rollDice(roomCode, playerIdx);
-  } else if (validMovesDetails.length > 1) {
-      expectedAction = 'MOVE';
-  } else if (validMovesDetails.length === 1) {
-      expectedAction = 'NONE'; 
-      // অটো-মুভের জন্য সার্ভার নিজে থেকেই অ্যাকশন নিবে অডিও শেষ হলে
-      pendingAction = () => {
-        const move = validMovesDetails[0]; 
-        moveToken(roomCode, playerIdx, move.tokenId, move.diceValue, move.ownerIdx);
-      };
+  } else if (validMovesDetails.length > 0) {
+      expectedAction = validMovesDetails.length > 1 ? 'MOVE' : 'NONE';
+      
+      // বট লজিক ফিক্সড: বটের একাধিক চাল থাকলেও সে বুদ্ধি করে গুটি বেছে নেবে
+      if (isBot(room, playerIdx) || validMovesDetails.length === 1) {
+          pendingAction = () => {
+              const move = isBot(room, playerIdx) 
+                  ? (validMovesDetails.find(m => m.isUnlock) || validMovesDetails.find(m => m.killVictimIdx !== -1) || validMovesDetails[0])
+                  : validMovesDetails[0];
+              moveToken(roomCode, playerIdx, move.tokenId, move.diceValue, move.ownerIdx);
+          };
+      }
   } else {
-      // কোনো চাল না থাকলে অডিও শেষে মেসেজ ফায়ার করে টার্ন চেঞ্জ হবে
       pendingAction = () => {
         rm.gameEvent(roomCode, 'NO_VALID_MOVE', {});
         prepareStateForAudio(roomCode, () => changeTurn(roomCode));
@@ -391,14 +389,18 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
   if (gs.rollPhase) {
       expectedAction = 'ROLL';
       if (isBot(room, playerIdx)) pendingAction = () => rollDice(roomCode, playerIdx);
-  } else if (remainingMoves.length > 1) {
-      expectedAction = 'MOVE';
-  } else if (remainingMoves.length === 1) {
-      expectedAction = 'NONE'; 
-      pendingAction = () => {
-          const nextMove = remainingMoves[0];
-          moveToken(roomCode, playerIdx, nextMove.tokenId, nextMove.diceValue, nextMove.ownerIdx);
-      };
+  } else if (remainingMoves.length > 0) {
+      expectedAction = remainingMoves.length > 1 ? 'MOVE' : 'NONE';
+      
+      // বট লজিক ফিক্সড
+      if (isBot(room, playerIdx) || remainingMoves.length === 1) {
+          pendingAction = () => {
+              const nextMove = isBot(room, playerIdx) 
+                  ? (remainingMoves.find(m => m.isUnlock) || remainingMoves.find(m => m.killVictimIdx !== -1) || remainingMoves[0])
+                  : remainingMoves[0];
+              moveToken(roomCode, playerIdx, nextMove.tokenId, nextMove.diceValue, nextMove.ownerIdx);
+          };
+      }
   } else {
       pendingAction = () => changeTurn(roomCode);
   }
@@ -446,7 +448,17 @@ function checkBotTurn(roomCode) {
   const room = rm.rooms.get(roomCode);
   if (!room || !room.game) return;
   if (isBot(room, room.game.turnIndex)) {
-      if (room.game.rollPhase) rollDice(roomCode, room.game.turnIndex);
+      if (room.game.rollPhase) {
+          rollDice(roomCode, room.game.turnIndex);
+      } else {
+          const validMoves = getValidMovesDetails(room.game, room.game.turnIndex);
+          if (validMoves.length > 0) {
+              const move = validMoves.find(m => m.isUnlock) || validMoves.find(m => m.killVictimIdx !== -1) || validMoves[0];
+              moveToken(roomCode, room.game.turnIndex, move.tokenId, move.diceValue, move.ownerIdx);
+          } else {
+              changeTurn(roomCode);
+          }
+      }
   }
 }
 
