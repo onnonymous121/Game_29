@@ -253,8 +253,13 @@ function rollDice(roomCode, playerIdx) {
   }
 
   let expectedAction = 'NONE';
-  if (gs.rollPhase) expectedAction = 'ROLL';
-  else if (validMovesDetails.length > 0) expectedAction = 'MOVE';
+  if (gs.rollPhase) {
+      expectedAction = 'ROLL';
+  } else if (validMovesDetails.length > 1) {
+      expectedAction = 'MOVE';
+  } else if (validMovesDetails.length === 1) {
+      expectedAction = 'NONE'; // Auto-move for 1 piece, so no focus needed
+  }
 
   rm.gameEvent(roomCode, 'DICE_ROLLED', { 
     diceValue: diceVal, 
@@ -273,7 +278,8 @@ function rollDice(roomCode, playerIdx) {
           rm.gameEvent(roomCode, 'NO_VALID_MOVE', {});
           changeTurn(roomCode);
         }, 1500);
-      } else if (isBot(room, playerIdx)) {
+      } else if (isBot(room, playerIdx) || validMovesDetails.length === 1) {
+        // Auto-move triggered for both bots and humans with only 1 possible move
         setTimeout(() => {
           const move = validMovesDetails[0]; 
           moveToken(roomCode, playerIdx, move.tokenId, move.diceValue, move.ownerIdx);
@@ -351,8 +357,13 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
   }
 
   let expectedAction = 'NONE';
-  if (gs.rollPhase) expectedAction = 'ROLL';
-  else if (remainingMoves.length > 0) expectedAction = 'MOVE';
+  if (gs.rollPhase) {
+      expectedAction = 'ROLL';
+  } else if (remainingMoves.length > 1) {
+      expectedAction = 'MOVE';
+  } else if (remainingMoves.length === 1) {
+      expectedAction = 'NONE'; // Auto-move for 1 piece
+  }
 
   rm.gameEvent(roomCode, eventType, { 
       playerIdx, 
@@ -371,7 +382,8 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
   if (gs.rollPhase) {
       setTimeout(() => checkBotTurn(roomCode), 1000);
   } else if (gs.pendingDice.length > 0 && remainingMoves.length > 0) {
-      if (isBot(room, playerIdx)) {
+      if (isBot(room, playerIdx) || remainingMoves.length === 1) {
+          // Auto-move triggered for both bots and humans
           setTimeout(() => {
               const nextMove = remainingMoves[0];
               moveToken(roomCode, playerIdx, nextMove.tokenId, nextMove.diceValue, nextMove.ownerIdx);
