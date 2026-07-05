@@ -165,10 +165,14 @@ function getValidMovesDetails(gs, playerIdx) {
                const killDetails = checkAndCutTokenSimulation(gs, ownerIdx, globalPos); 
                if (killDetails) killVictimIdx = killDetails.victimIdx;
              }
+           } else if (newPos > 50 && newPos <= 57) {
+             // 51 to 57 is safe home path
+             isSafeZone = true;
            }
            
            if (!isFinish) {
-               for(let i = 1; i <= 6; i++) {
+               // সামনের ৫০ ঘর পর্যন্ত (পুরো ট্র্যাক) এনিমি চেক করা হবে
+               for(let i = 1; i <= 50; i++) {
                    if (newPos + i <= 50) {
                        let gPos = getGlobalPosition(ownerIdx, newPos + i);
                        if (!SAFE_ZONES.includes(gPos)) { 
@@ -279,7 +283,6 @@ function rollDice(roomCode, playerIdx) {
           changeTurn(roomCode);
         }, 1500);
       } else if (isBot(room, playerIdx) || validMovesDetails.length === 1) {
-        // Auto-move triggered for both bots and humans with only 1 possible move
         setTimeout(() => {
           const move = validMovesDetails[0]; 
           moveToken(roomCode, playerIdx, move.tokenId, move.diceValue, move.ownerIdx);
@@ -383,7 +386,6 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
       setTimeout(() => checkBotTurn(roomCode), 1000);
   } else if (gs.pendingDice.length > 0 && remainingMoves.length > 0) {
       if (isBot(room, playerIdx) || remainingMoves.length === 1) {
-          // Auto-move triggered for both bots and humans
           setTimeout(() => {
               const nextMove = remainingMoves[0];
               moveToken(roomCode, playerIdx, nextMove.tokenId, nextMove.diceValue, nextMove.ownerIdx);
