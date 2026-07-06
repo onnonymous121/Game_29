@@ -23,6 +23,15 @@ function newLudoState(playMode) {
     isWaitingForAudio: false, 
     pendingAction: null,      
     actionTimer: null,
+    
+    // নতুন যুক্ত হওয়া স্টেটসমূহ
+    playerStats: [
+        { turnsWithoutSix: 0 }, { turnsWithoutSix: 0 }, 
+        { turnsWithoutSix: 0 }, { turnsWithoutSix: 0 }
+    ],
+    revengeActive: [false, false, false, false],
+    skippedPlayers: [false, false, false, false], // ডিসকানেক্ট হওয়া প্লেয়ারদের স্কিপ করার জন্য
+
     tokens: [
       [{ id: 0, pos: -1 }, { id: 1, pos: -1 }, { id: 2, pos: -1 }, { id: 3, pos: -1 }], 
       [{ id: 0, pos: -1 }, { id: 1, pos: -1 }, { id: 2, pos: -1 }, { id: 3, pos: -1 }], 
@@ -67,7 +76,6 @@ function prepareStateForAudio(roomCode, pendingActionFn) {
   room.game.isWaitingForAudio = true;
   room.game.pendingAction = pendingActionFn || null;
   
-  // সেফটি ফলব্যাক
   room.game.actionTimer = setTimeout(() => {
       forceAudioDone(roomCode);
   }, 6000);
@@ -151,6 +159,16 @@ function handleGameAction(roomCode, playerId, msg) {
           handleAudioDoneSignal(roomCode);
       }
       break;
+    // ফ্লাটার অ্যাপ মিনিমাইজ বা নোটিফিকেশন ওপেন করলে স্ট্যাটাস ব্রডকাস্ট
+    case 'ACTION_AWAY':
+      rm.broadcastToRoom(roomCode, { type: 'GAME_EVENT', event: 'PLAYER_AWAY', payload: { playerIdx: senderIdx }});
+      break;
+    case 'ACTION_RETURN':
+      rm.broadcastToRoom(roomCode, { type: 'GAME_EVENT', event: 'PLAYER_RETURN', payload: { playerIdx: senderIdx }});
+      break;
+    case 'SEND_EMOJI':
+      rm.broadcastToRoom(roomCode, { type: 'GAME_EVENT', event: 'EMOJI_SENT', payload: { playerIdx: senderIdx, emojiId: msg.emojiId }});
+      break;
   }
 }
 
@@ -175,7 +193,10 @@ function getValidMovesDetails(gs, playerIdx) {
         let isFinish = false;
         let killVictimIdx = -1;
         let isSafeZone = false;
-        let enemiesAhead = [];
+        
+        // এনিমি রাডার লজিক আপডেট
+        let strikeZone = [];
+        let distantEnemies = [];
 
         if (t.pos === -1 && diceVal === 6) {
           newPos = 0;
@@ -198,13 +219,20 @@ function getValidMovesDetails(gs, playerIdx) {
              isSafeZone = true;
            }
            
-           if (!isFinish) {
-               for(let i = 1; i <= 50; i++) {
-                   if (newPos + i <= 50) {
-                       let gPos = getGlobalPosition(ownerIdx, newPos + i);
+           // বর্তমান অবস্থান থেকে সামনের এনিমি স্ক্যান
+           if (!isFinish && t.pos !== -1) {
+               for(let i = 1; i <= 57; i++) {
+                   if (t.pos + i <= 50) {
+                       let gPos = getGlobalPosition(ownerIdx, t.pos + i);
                        if (!SAFE_ZONES.includes(gPos)) { 
                            let check = checkAndCutTokenSimulation(gs, ownerIdx, gPos);
-                           if (check) enemiesAhead.push(i);
+                           if (check) {
+                               if (i <= 6) {
+                                   strikeZone.push(i);
+                               } else {
+                                   distantEnemies.push(i);
+                               }
+                           }
                        }
                    }
                }
@@ -220,7 +248,8 @@ function getValidMovesDetails(gs, playerIdx) {
              isFinish: isFinish,
              killVictimIdx: killVictimIdx,
              isSafeZone: isSafeZone,
-             enemiesAhead: enemiesAhead
+             strikeZone: strikeZone,
+             enemiesAhead: distantEnemies
            });
         }
       });
@@ -248,7 +277,26 @@ function rollDice(roomCode, playerIdx) {
 
   if (gs.turnIndex !== playerIdx || !gs.rollPhase) return;
 
-  const diceVal = Math.floor(Math.random() * 6) + 1; 
+  let chance = Math.random();
+  let diceVal = Math.floor(chance * 6) + 1; 
+
+  // Pity Timer & Revenge Mode লজিক
+  const pStats = gs.playerStats[playerIdx];
+  const hasRevenge = gs.revengeActive[playerIdx];
+
+  if (hasRevenge) {
+      diceVal = chance > 0.4 ? 6 : (Math.floor(chance * 5) + 1);
+      gs.revengeActive[playerIdx] = false; // সুযোগ একবারই
+  } else if (pStats.turnsWithoutSix >= 10) {
+      diceVal = 6;
+  } else if (pStats.turnsWithoutSix >= 6) {
+      diceVal = chance > 0.5 ? 6 : (Math.floor(chance * 5) + 1);
+  }
+
+  // স্ট্যাটস আপডেট
+  if (diceVal === 6) pStats.turnsWithoutSix = 0;
+  else pStats.turnsWithoutSix++;
+
   gs.pendingDice.push(diceVal);
 
   if (diceVal === 6) {
@@ -292,7 +340,6 @@ function rollDice(roomCode, playerIdx) {
   } else if (validMovesDetails.length > 0) {
       expectedAction = validMovesDetails.length > 1 ? 'MOVE' : 'NONE';
       
-      // বট লজিক ফিক্সড: বটের একাধিক চাল থাকলেও সে বুদ্ধি করে গুটি বেছে নেবে
       if (isBot(room, playerIdx) || validMovesDetails.length === 1) {
           pendingAction = () => {
               const move = isBot(room, playerIdx) 
@@ -343,6 +390,12 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
 
   const token = gs.tokens[ownerIdx].find(t => t.id === tokenId);
   let eventType = 'TOKEN_MOVED';
+
+  // লাকি জোন লজিক চেক (গুটি মুভ করার আগে)
+  let isLuckyZoneHit = false;
+  if (token.pos === 0 && diceValue === 5 && (tokenId === 0 || tokenId === 3)) {
+      isLuckyZoneHit = true;
+  }
   
   if (move.isUnlock) {
       token.pos = 0;
@@ -365,6 +418,15 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
       }
       eventType = 'TOKEN_CUT';
       gs.rollPhase = true; 
+      
+      // রেন্ডম রিভেঞ্জ মোড ট্রিগার
+      if (Math.random() < 0.40) gs.revengeActive[move.killVictimIdx] = true;
+  }
+
+  // লাকি জোনের বোনাস অ্যাপ্লাই
+  if (isLuckyZoneHit) {
+      gs.rollPhase = true; 
+      if (eventType === 'TOKEN_MOVED') eventType = 'LUCKY_ZONE_HIT';
   }
 
   if (move.isFinish) gs.rollPhase = true; 
@@ -392,7 +454,6 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
   } else if (remainingMoves.length > 0) {
       expectedAction = remainingMoves.length > 1 ? 'MOVE' : 'NONE';
       
-      // বট লজিক ফিক্সড
       if (isBot(room, playerIdx) || remainingMoves.length === 1) {
           pendingAction = () => {
               const nextMove = isBot(room, playerIdx) 
@@ -428,7 +489,14 @@ function changeTurn(roomCode) {
   gs.pendingDice = [];
   gs.consecutiveSixes = 0;
   gs.rollPhase = true; 
-  do { gs.turnIndex = (gs.turnIndex + 1) % 4; } while (gs.winners.includes(gs.turnIndex));
+  
+  // লুপের মাধ্যমে স্কিপ করা প্লেয়ার এবং উইনারদের বাদ দিয়ে টার্ন নির্ধারণ
+  let loopCount = 0;
+  do { 
+      gs.turnIndex = (gs.turnIndex + 1) % 4; 
+      loopCount++;
+      if(loopCount > 4) break; 
+  } while (gs.winners.includes(gs.turnIndex) || gs.skippedPlayers[gs.turnIndex]);
   
   let pendingAction = null;
   if (isBot(room, gs.turnIndex)) {
@@ -480,12 +548,30 @@ function syncGameState(roomCode, playerId, slot) {
     pendingDice: room.game.pendingDice,
     rollPhase: room.game.rollPhase,
     players: room.players, 
+    skippedPlayers: room.game.skippedPlayers,
     myPlayerIndex: slot,
     expectedAction: room.game.rollPhase ? 'ROLL' : 'MOVE',
     actionPlayerIdx: room.game.turnIndex
   }, playerId);
 }
 
-function handlePlayerDisconnectDuringGame(roomCode, slot) { checkBotTurn(roomCode); }
+// প্লেয়ার ডিসকানেক্ট অটো স্কিপ / বট লজিক
+function handlePlayerDisconnectDuringGame(roomCode, slot) {
+    const room = rm.rooms.get(roomCode);
+    if (!room || !room.game) return;
+
+    if (room.game.playMode === 'team') {
+        checkBotTurn(roomCode);
+    } else {
+        // ইন্ডিভিজুয়াল মোডে প্লেয়ার স্কিপ হবে
+        room.game.skippedPlayers[slot] = true;
+        
+        // যদি ডিসকানেক্ট হওয়া প্লেয়ারের টার্ন চলমান থাকে, তবে সাথে সাথেই টার্ন চেঞ্জ হবে
+        if (room.game.turnIndex === slot) {
+            if (room.game.actionTimer) clearTimeout(room.game.actionTimer);
+            changeTurn(roomCode);
+        }
+    }
+}
 
 module.exports = { initGame, handleGameAction, handlePlayerDisconnectDuringGame };
