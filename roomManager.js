@@ -1,7 +1,7 @@
 /**
  * Universal Room Manager
  * =====================================================
- * এটি সমস্ত গেমের (Game 29, Ludo, CallBreak) রুম কন্ট্রোল এবং সেন্ট্রাল ইকোনমি হ্যান্ডেল করবে।
+ * এটি সমস্ত গেমের (Game 29, Ludo, CallBreak)ルーム コントロール এবং সেন্ট্রাল ইকোনমি হ্যান্ডেল করবে।
  */
 
 'use strict';
@@ -28,7 +28,7 @@ module.exports.playerConnections = playerConnections;
 // GAME MODULES REGISTRY
 // ============================================================
 const game29Module = require('./games/game29');
-const ludoModule = require('./games/ludo'); // লুডোর ফাইল তৈরি হলে আনকমেন্ট করবেন
+const ludoModule = require('./games/ludo'); 
 
 const AVAILABLE_GAMES = {
   '29': game29Module,
@@ -86,7 +86,7 @@ function broadcastRoomUpdate(roomCode) {
       gameType: room.gameType, playMode: room.playMode, 
       allowAudience: room.allowAudience, sessionId: room.sessionId,
       players: room.players, requests: room.requests, audiences: room.audiences,
-      prizePool: room.prizePool || 0 // প্রাইজ পুল আপডেট
+      prizePool: room.prizePool || 0 
     },
   });
 }
@@ -115,11 +115,9 @@ function getFeeBasedOnLevel(level) {
 }
 
 function calculateDynamicLevel(xp) {
-  // প্রতি 500 XP তে ১ লেভেল। লেভেল কখনোই 1 এর নিচে বা 120 এর উপরে যাবে না
   return Math.min(120, Math.max(1, Math.floor(xp / 500) + 1));
 }
 
-// গেম মডিউল (২৯, লুডো) গেম শেষ হলে এই ফাংশনটি কল করবে
 async function resolveUniversalGame(roomCode, winnerSlotsArray) {
   const room = rooms.get(roomCode);
   if (!room) return;
@@ -128,7 +126,6 @@ async function resolveUniversalGame(roomCode, winnerSlotsArray) {
   const winners = [];
   const losers = [];
 
-  // উইনার এবং লুজার আলাদা করা
   for (let pid of realPlayers) {
     if (winnerSlotsArray.includes(room.players[pid].slot)) {
       winners.push(pid);
@@ -137,13 +134,11 @@ async function resolveUniversalGame(roomCode, winnerSlotsArray) {
     }
   }
 
-  // প্রাইজ পুল হিসাব (৫% সার্ভার ট্যাক্স)
   const prizePool = room.prizePool || 0;
   const rewardPerWinner = winners.length > 0 ? Math.floor((prizePool * 0.95) / winners.length) : 0;
 
   const results = {};
 
-  // উইনারদের আপডেট (+XP, +Coins)
   for (let pid of winners) {
     const user = await User.findOne({ uid: pid });
     if (user) {
@@ -155,11 +150,10 @@ async function resolveUniversalGame(roomCode, winnerSlotsArray) {
     }
   }
 
-  // লুজারদের আপডেট (-XP)
   for (let pid of losers) {
     const user = await User.findOne({ uid: pid });
     if (user) {
-      user.xp = Math.max(0, user.xp - 20); // XP কমবে
+      user.xp = Math.max(0, user.xp - 20); 
       user.level = calculateDynamicLevel(user.xp);
       await user.save();
       results[pid] = { status: 'loss', coinsEarned: 0, newCoins: user.coins, newLevel: user.level, xpChange: '-20' };
@@ -167,9 +161,8 @@ async function resolveUniversalGame(roomCode, winnerSlotsArray) {
   }
 
   room.status = 'WAITING';
-  room.prizePool = 0; // প্রাইজ পুল রিসেট
+  room.prizePool = 0; 
   
-  // ক্লায়েন্টকে ফলাফল জানিয়ে দেওয়া
   broadcastToRoom(roomCode, {
     type: 'GAME_OVER_RESULTS',
     results: results
@@ -248,7 +241,7 @@ router.post('/rooms/create', (req, res) => {
     requests: {}, audiences: {},
     game: null,
     disconnectedPlayers: {},
-    prizePool: 0, // প্রাইজ পুল যোগ করা হলো
+    prizePool: 0, 
   });
   res.json({ success: true, roomCode, gameType: finalGameType, playMode: finalPlayMode });
 });
@@ -338,12 +331,10 @@ router.post('/rooms/:code/start', async (req, res) => {
   if (!room) return res.status(404).json({ error: 'Room not found' });
   if (room.hostId !== hostId) return res.status(403).json({ error: 'Not the host' });
 
-  // ১. সকল রিয়েল প্লেয়ার ফিল্টার করা (অডিয়েন্স ও বট বাদ দিয়ে)
   const realPlayers = Object.keys(room.players).filter(pid => !room.players[pid].isBot);
   let totalPrizePool = 0;
   const playerUpdates = [];
 
-  // ২. ব্যালেন্স চেক এবং ফি ক্যালকুলেশন
   for (let pid of realPlayers) {
     const user = await User.findOne({ uid: pid });
     if (!user) continue;
@@ -361,22 +352,16 @@ router.post('/rooms/:code/start', async (req, res) => {
     playerUpdates.push({ user, fee: requiredFee });
   }
 
-  // ৩. সবার ব্যালেন্স ঠিক থাকলে কয়েন কাটা হবে
   for (let { user, fee } of playerUpdates) {
     user.coins -= fee;
     await user.save();
     totalPrizePool += fee;
   }
 
-  room.prizePool = totalPrizePool; // গেম শেষের জন্য প্রাইজ পুল সেভ করা হলো
+  room.prizePool = totalPrizePool; 
 
-  // ৪. খালি স্লটে বট বসিয়ে গেম শুরু
-  for (let i = 0; i < 4; i++) {
-    const occupied = Object.values(room.players).map(p => p.slot);
-    if (!occupied.includes(i)) {
-      room.players[`BOT_${i}`] = { name: 'Bot', slot: i, isBot: true };
-    }
-  }
+  // UPDATED: এখানে থাকা জোরপূর্বক বট অটো-ফিল লজিকটি (for loop) রিমুভ করা হয়েছে। 
+  // এখন ব্যবহারকারী লবি থেকে যে কয়টি বট বা প্লেয়ার সিলেক্ট করবে, শুধু তাদের নিয়েই গেম স্টার্ট হবে।
 
   const sid = sessionId || crypto.randomUUID();
   room.sessionId = sid;

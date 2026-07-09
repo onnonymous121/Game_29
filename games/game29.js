@@ -63,6 +63,7 @@ function newGameState(roundStarterIndex = 1) {
 
     teamScores: [0, 0],
     gamePoints: [0, 0],
+    voidSuits: [[], [], [], []], // ADDED: বটের মেমরির জন্য, কে কোন রঙে ভয়েড তা মনে রাখা
   };
 }
 
@@ -102,7 +103,14 @@ function startNewRound(roomCode) {
   const room = rm.rooms.get(roomCode);
   if (!room) return;
 
+  // ADDED: আগের রাউন্ডের গেম পয়েন্ট সেভ করে রাখা
+  const previousGamePoints = room.game ? room.game.gamePoints : [0, 0];
+
   const gs = newGameState(room.game ? room.game.roundStarterIndex : 1);
+  
+  // ADDED: নতুন গেমে আগের পয়েন্টগুলো বসিয়ে দেওয়া
+  gs.gamePoints = previousGamePoints;
+  
   room.game = gs;
   room.status = 'PLAYING';
 
@@ -194,6 +202,13 @@ function processBidTurn(roomCode) {
     }
     return;
   }
+
+  // ADDED: সবার কাছে বিডিং টার্ন ব্রডকাস্ট করা যেন ফ্রন্টএন্ডে কার ডাক সেটা দেখানো যায়
+  rm.broadcastToRoom(roomCode, {
+    type: 'GAME_EVENT',
+    event: 'BID_TURN_INFO',
+    payload: { currentBidderIdx: gs.currentBidderIdx }
+  });
 
   const slots = getSlotAssignments(room);
   const pid = slots[gs.currentBidderIdx];
@@ -586,12 +601,15 @@ function applyMove(roomCode, senderIdx, card) {
     }
   }
 
-  if (!gs.isTrumpRevealed && gs.leadSuit && cardSuit(card) === gs.trumpSuit &&
-      !hand.some(c => cardSuit(c) === gs.leadSuit)) {
-    gs.isTrumpRevealed = true;
-    gs.currentTrickTrumpRevealer = senderIdx;
-    rm.gameEvent(roomCode, 'TRUMP_REVEAL', { suit: gs.trumpSuit, revealerIdx: senderIdx });
+  // ADDED: স্মার্ট বটের মেমরির জন্য কেউ অন্য রঙ খেললে সেটা সেভ করে রাখা
+  if (gs.leadSuit && cardSuit(card) !== gs.leadSuit) {
+    if (!gs.voidSuits[senderIdx].includes(gs.leadSuit)) {
+      gs.voidSuits[senderIdx].push(gs.leadSuit);
+    }
   }
+
+  // (REMOVED) অটোমেটিক তুরুপ রিভিল হওয়ার লজিকটি এখান থেকে মুছে দেওয়া হয়েছে। 
+  // এখন থেকে তুরুপ হাইড থাকবে যতক্ষণ না প্লেয়ার ম্যানুয়ালি রিভিল করে।
 
   gs.hands[senderIdx] = hand.filter(c => c !== card);
 
@@ -643,12 +661,26 @@ function botPlay(roomCode, idx) {
   
   // ── স্মার্ট এআই লজিক: প্রথম চাল দেওয়ার সময় ──
   if (gs.currentTrick.length === 0) {
-    const aces = hand.filter(c => cardRank(c) === 'a');
+    // ADDED: প্রতিপক্ষের কাছে ওই রঙ আছে কি না তা মেমরি থেকে চেক করা
+    const opp1 = (idx + 1) % 4;
+    const opp2 = (idx + 3) % 4;
+    
+    let safeCards = hand.filter(c => {
+      const s = cardSuit(c);
+      // যদি দুই প্রতিপক্ষের কারো কাছেই এই রঙ না থাকে, তাহলে সেটা রিস্কি
+      return !gs.voidSuits[opp1].includes(s) && !gs.voidSuits[opp2].includes(s);
+    });
+
+    if (safeCards.length === 0) {
+        safeCards = hand; // যদি নিরাপদ কোনো কার্ড না থাকে, তবে সাধারণ নিয়মে খেলবে
+    }
+
+    const aces = safeCards.filter(c => cardRank(c) === 'a');
     if (aces.length > 0) {
       // যদি টেক্কা থাকে, সেটা আগে খেলে পয়েন্ট নিশ্চিত করবে
       card = aces[Math.floor(Math.random() * aces.length)];
     } else {
-      card = hand.reduce((a, b) => cardPower(a) > cardPower(b) ? a : b);
+      card = safeCards.reduce((a, b) => cardPower(a) > cardPower(b) ? a : b);
     }
   } else {
     const lead = gs.leadSuit;
