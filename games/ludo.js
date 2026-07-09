@@ -14,6 +14,7 @@ const START_POSITIONS = { 0: 1, 1: 14, 2: 27, 3: 40 };
 function newLudoState(playMode) {
   return {
     playMode: playMode, 
+    activePlayerCount: 4, // নতুন যুক্ত করা হয়েছে: কতজন খেলছে তা মনে রাখার জন্য
     turnIndex: 0,
     turnStartTime: Date.now(), 
     pendingDice: [], 
@@ -24,13 +25,12 @@ function newLudoState(playMode) {
     pendingAction: null,      
     actionTimer: null,
     
-    // নতুন যুক্ত হওয়া স্টেটসমূহ
     playerStats: [
         { turnsWithoutSix: 0 }, { turnsWithoutSix: 0 }, 
         { turnsWithoutSix: 0 }, { turnsWithoutSix: 0 }
     ],
     revengeActive: [false, false, false, false],
-    skippedPlayers: [false, false, false, false], // ডিসকানেক্ট হওয়া প্লেয়ারদের স্কিপ করার জন্য
+    skippedPlayers: [false, false, false, false], 
 
     tokens: [
       [{ id: 0, pos: -1 }, { id: 1, pos: -1 }, { id: 2, pos: -1 }, { id: 3, pos: -1 }], 
@@ -114,12 +114,36 @@ function initGame(roomCode) {
   room.game = newLudoState(room.playMode); 
   
   let botCount = 1;
+  const activeSlots = [];
+  
+  // কে কে খেলছে তার তালিকা তৈরি
   Object.keys(room.players).forEach(pid => {
+      activeSlots.push(room.players[pid].slot);
       if (room.players[pid].isBot) {
           room.players[pid].name = `Bot ${botCount}`;
           botCount++;
       }
   });
+
+  room.game.activePlayerCount = activeSlots.length;
+
+  // ফাঁকা স্লটগুলো স্কিপ করে দেওয়া
+  for (let i = 0; i < 4; i++) {
+      if (!activeSlots.includes(i)) {
+          room.game.skippedPlayers[i] = true;
+          room.game.tokens[i] = []; // ফাঁকা স্লটের টোকেন মুছে দেওয়া
+      }
+  }
+
+  // প্রথম টার্ন যেন ফাঁকা স্লটে না যায় সেটা নিশ্চিত করা
+  if (room.game.skippedPlayers[room.game.turnIndex]) {
+      let loopCount = 0;
+      do {
+          room.game.turnIndex = (room.game.turnIndex + 1) % 4;
+          loopCount++;
+          if (loopCount > 4) break;
+      } while (room.game.skippedPlayers[room.game.turnIndex]);
+  }
 
   let nextAction = null;
   if (isBot(room, room.game.turnIndex)) {
@@ -131,11 +155,11 @@ function initGame(roomCode) {
     type: 'GAME_EVENT', 
     event: 'GAME_STARTED', 
     payload: { 
-        turnIndex: 0, 
+        turnIndex: room.game.turnIndex, 
         playMode: room.playMode, 
         players: room.players,
         expectedAction: 'ROLL',
-        actionPlayerIdx: 0
+        actionPlayerIdx: room.game.turnIndex
     } 
   });
 }
@@ -159,7 +183,6 @@ function handleGameAction(roomCode, playerId, msg) {
           handleAudioDoneSignal(roomCode);
       }
       break;
-    // ফ্লাটার অ্যাপ মিনিমাইজ বা নোটিফিকেশন ওপেন করলে স্ট্যাটাস ব্রডকাস্ট
     case 'ACTION_AWAY':
       rm.broadcastToRoom(roomCode, { type: 'GAME_EVENT', event: 'PLAYER_AWAY', payload: { playerIdx: senderIdx }});
       break;
@@ -194,7 +217,6 @@ function getValidMovesDetails(gs, playerIdx) {
         let killVictimIdx = -1;
         let isSafeZone = false;
         
-        // এনিমি রাডার লজিক আপডেট
         let strikeZone = [];
         let distantEnemies = [];
 
@@ -219,7 +241,6 @@ function getValidMovesDetails(gs, playerIdx) {
              isSafeZone = true;
            }
            
-           // বর্তমান অবস্থান থেকে সামনের এনিমি স্ক্যান
            if (!isFinish && t.pos !== -1) {
                for(let i = 1; i <= 57; i++) {
                    if (t.pos + i <= 50) {
@@ -280,20 +301,18 @@ function rollDice(roomCode, playerIdx) {
   let chance = Math.random();
   let diceVal = Math.floor(chance * 6) + 1; 
 
-  // Pity Timer & Revenge Mode লজিক
   const pStats = gs.playerStats[playerIdx];
   const hasRevenge = gs.revengeActive[playerIdx];
 
   if (hasRevenge) {
       diceVal = chance > 0.4 ? 6 : (Math.floor(chance * 5) + 1);
-      gs.revengeActive[playerIdx] = false; // সুযোগ একবারই
+      gs.revengeActive[playerIdx] = false; 
   } else if (pStats.turnsWithoutSix >= 10) {
       diceVal = 6;
   } else if (pStats.turnsWithoutSix >= 6) {
       diceVal = chance > 0.5 ? 6 : (Math.floor(chance * 5) + 1);
   }
 
-  // স্ট্যাটস আপডেট
   if (diceVal === 6) pStats.turnsWithoutSix = 0;
   else pStats.turnsWithoutSix++;
 
@@ -391,7 +410,6 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
   const token = gs.tokens[ownerIdx].find(t => t.id === tokenId);
   let eventType = 'TOKEN_MOVED';
 
-  // লাকি জোন লজিক চেক (গুটি মুভ করার আগে)
   let isLuckyZoneHit = false;
   if (token.pos === 0 && diceValue === 5 && (tokenId === 0 || tokenId === 3)) {
       isLuckyZoneHit = true;
@@ -419,11 +437,9 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
       eventType = 'TOKEN_CUT';
       gs.rollPhase = true; 
       
-      // রেন্ডম রিভেঞ্জ মোড ট্রিগার
       if (Math.random() < 0.40) gs.revengeActive[move.killVictimIdx] = true;
   }
 
-  // লাকি জোনের বোনাস অ্যাপ্লাই
   if (isLuckyZoneHit) {
       gs.rollPhase = true; 
       if (eventType === 'TOKEN_MOVED') eventType = 'LUCKY_ZONE_HIT';
@@ -433,7 +449,9 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
 
   if (checkWinCondition(gs, ownerIdx)) {
     if (!gs.winners.includes(ownerIdx)) gs.winners.push(ownerIdx);
-    if (gs.winners.length === 3 || (gs.playMode === 'team' && checkTeamWin(gs))) {
+    
+    // উইন কন্ডিশন আপডেট: ২ জন খেললে ১ জন জিতলেই গেম ওভার
+    if (gs.winners.length >= gs.activePlayerCount - 1 || (gs.playMode === 'team' && checkTeamWin(gs))) {
        prepareStateForAudio(roomCode, () => rm.gameEvent(roomCode, 'GAME_OVER', { winners: gs.winners }));
        rm.gameEvent(roomCode, 'TOKEN_FINISHED', { playerIdx, ownerIdx, tokenId, newPos: move.newPos, diceValue, cutDetails });
        return;
@@ -490,7 +508,6 @@ function changeTurn(roomCode) {
   gs.consecutiveSixes = 0;
   gs.rollPhase = true; 
   
-  // লুপের মাধ্যমে স্কিপ করা প্লেয়ার এবং উইনারদের বাদ দিয়ে টার্ন নির্ধারণ
   let loopCount = 0;
   do { 
       gs.turnIndex = (gs.turnIndex + 1) % 4; 
@@ -555,7 +572,6 @@ function syncGameState(roomCode, playerId, slot) {
   }, playerId);
 }
 
-// প্লেয়ার ডিসকানেক্ট অটো স্কিপ / বট লজিক
 function handlePlayerDisconnectDuringGame(roomCode, slot) {
     const room = rm.rooms.get(roomCode);
     if (!room || !room.game) return;
@@ -563,10 +579,8 @@ function handlePlayerDisconnectDuringGame(roomCode, slot) {
     if (room.game.playMode === 'team') {
         checkBotTurn(roomCode);
     } else {
-        // ইন্ডিভিজুয়াল মোডে প্লেয়ার স্কিপ হবে
         room.game.skippedPlayers[slot] = true;
         
-        // যদি ডিসকানেক্ট হওয়া প্লেয়ারের টার্ন চলমান থাকে, তবে সাথে সাথেই টার্ন চেঞ্জ হবে
         if (room.game.turnIndex === slot) {
             if (room.game.actionTimer) clearTimeout(room.game.actionTimer);
             changeTurn(roomCode);
