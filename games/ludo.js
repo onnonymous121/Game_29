@@ -14,7 +14,7 @@ const START_POSITIONS = { 0: 1, 1: 14, 2: 27, 3: 40 };
 function newLudoState(playMode) {
   return {
     playMode: playMode, 
-    activePlayerCount: 4, // নতুন যুক্ত করা হয়েছে: কতজন খেলছে তা মনে রাখার জন্য
+    activePlayerCount: 4, 
     turnIndex: 0,
     turnStartTime: Date.now(), 
     pendingDice: [], 
@@ -304,11 +304,12 @@ function rollDice(roomCode, playerIdx) {
   const pStats = gs.playerStats[playerIdx];
   const hasRevenge = gs.revengeActive[playerIdx];
 
+  // ── পরিবর্তন: ১০ বার ৬ না উঠলেও এখন ৫০% চান্স ──
   if (hasRevenge) {
       diceVal = chance > 0.4 ? 6 : (Math.floor(chance * 5) + 1);
       gs.revengeActive[playerIdx] = false; 
   } else if (pStats.turnsWithoutSix >= 10) {
-      diceVal = 6;
+      diceVal = chance > 0.5 ? 6 : (Math.floor(chance * 5) + 1);
   } else if (pStats.turnsWithoutSix >= 6) {
       diceVal = chance > 0.5 ? 6 : (Math.floor(chance * 5) + 1);
   }
