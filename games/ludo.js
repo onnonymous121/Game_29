@@ -306,7 +306,7 @@ function rollDice(roomCode, playerIdx) {
 
   // ── পরিবর্তন: ১০ বার ৬ না উঠলেও এখন ৫০% চান্স ──
   if (hasRevenge) {
-      diceVal = chance > 0.4 ? 6 : (Math.floor(chance * 5) + 1);
+      diceVal = chance > 0.7 ? 6 : (Math.floor(chance * 5) + 1);
       gs.revengeActive[playerIdx] = false; 
   } else if (pStats.turnsWithoutSix >= 10) {
       diceVal = chance > 0.5 ? 6 : (Math.floor(chance * 5) + 1);
@@ -438,7 +438,7 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
       eventType = 'TOKEN_CUT';
       gs.rollPhase = true; 
       
-      if (Math.random() < 0.40) gs.revengeActive[move.killVictimIdx] = true;
+      if (Math.random() < 0.20) gs.revengeActive[move.killVictimIdx] = true;
   }
 
   if (isLuckyZoneHit) {
