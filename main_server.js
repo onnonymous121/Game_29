@@ -40,30 +40,53 @@ httpServer.on('upgrade', (request, socket, head) => {
   });
 });
 
+// ── Updated Login API for Email/Password & Google ──
 app.post('/api/login', async (req, res) => {
-  const { idToken, authType, guestName } = req.body;
+  const { idToken, authType, fullName, userName } = req.body;
   try {
     let uid, name;
-    if (authType === 'Google') {
+    
+    if (authType === 'Google' || authType === 'Email') {
       const decodedToken = await getAuth().verifyIdToken(idToken);
       uid = decodedToken.uid;
-      name = decodedToken.name || 'Google Player';
+      // Use fullName from request (for new Email users) or fallback to token name
+      name = fullName || decodedToken.name || 'Player';
     } else {
-      uid = idToken; 
-      name = guestName || 'Guest Player';
+      return res.status(400).json({ error: 'Invalid authType' });
     }
 
     let user = await User.findOne({ uid: uid });
+    
     if (!user) {
+      if (userName) {
+        const existingUsername = await User.findOne({ nickname: userName });
+        if (existingUsername) {
+          return res.status(400).json({ error: 'Username already taken. Please choose another.' });
+        }
+      }
+
       user = new User({ uid: uid, name: name, coins: 5000, level: 1, xp: 0 });
+      if (userName) {
+        user.nickname = userName;
+      }
       await user.save();
+    } else {
+      if (userName && !user.nickname) {
+        const existingUsername = await User.findOne({ nickname: userName });
+        if (!existingUsername) {
+          user.nickname = userName;
+          await user.save();
+        }
+      }
     }
 
     const responseUser = user.toObject();
-    responseUser.name = user.nickname ? user.nickname : user.name;
+    responseUser.name = user.name;
+    responseUser.nickname = user.nickname || user.name;
 
     res.json({ success: true, user: responseUser });
   } catch (error) {
+    console.error('Login error:', error);
     res.status(500).json({ error: 'Authentication Failed' });
   }
 });
@@ -131,7 +154,6 @@ app.post('/api/reward-coins', async (req, res) => {
   }
 });
 
-// ── নতুন API: প্লেয়ারদের মধ্যে কয়েন ট্রান্সফার ──
 app.post('/api/transfer-coins', async (req, res) => {
   const { senderUid, receiverUid, amount } = req.body;
   
@@ -155,7 +177,6 @@ app.post('/api/transfer-coins', async (req, res) => {
       return res.status(400).json({ error: 'Insufficient coins.' });
     }
 
-    // ব্যালেন্স আপডেট
     sender.coins -= transferAmount;
     receiver.coins += transferAmount;
 
@@ -172,7 +193,6 @@ app.post('/api/transfer-coins', async (req, res) => {
   }
 });
 
-// ফ্রন্টএন্ডের সুবিধার জন্য গ্লোবাল রাউটার মাউন্ট করা হলো
 app.use('/game29', roomManager.router);
 
 app.get('/', (req, res) => res.send('Global Game Hub Server Running!'));
