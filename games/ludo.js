@@ -1,6 +1,6 @@
 /**
- * Ludo — Core Logic Module
- * Path: games/ludo.js
+* Ludo — Core Logic Module
+ *Path: games/ludo.js
  */
 
 'use strict';
@@ -116,7 +116,6 @@ function initGame(roomCode) {
   let botCount = 1;
   const activeSlots = [];
   
-  // কে কে খেলছে তার তালিকা তৈরি
   Object.keys(room.players).forEach(pid => {
       activeSlots.push(room.players[pid].slot);
       if (room.players[pid].isBot) {
@@ -127,15 +126,13 @@ function initGame(roomCode) {
 
   room.game.activePlayerCount = activeSlots.length;
 
-  // ফাঁকা স্লটগুলো স্কিপ করে দেওয়া
   for (let i = 0; i < 4; i++) {
       if (!activeSlots.includes(i)) {
           room.game.skippedPlayers[i] = true;
-          room.game.tokens[i] = []; // ফাঁকা স্লটের টোকেন মুছে দেওয়া
+          room.game.tokens[i] = []; 
       }
   }
 
-  // প্রথম টার্ন যেন ফাঁকা স্লটে না যায় সেটা নিশ্চিত করা
   if (room.game.skippedPlayers[room.game.turnIndex]) {
       let loopCount = 0;
       do {
@@ -158,6 +155,7 @@ function initGame(roomCode) {
         turnIndex: room.game.turnIndex, 
         playMode: room.playMode, 
         players: room.players,
+        skippedPlayers: room.game.skippedPlayers,
         expectedAction: 'ROLL',
         actionPlayerIdx: room.game.turnIndex
     } 
@@ -167,16 +165,61 @@ function initGame(roomCode) {
 function handleGameAction(roomCode, playerId, msg) {
   const room = rm.rooms.get(roomCode);
   if (!room || !room.game) return;
+  
+  let senderIdx = -1;
   const isAudience = !!room.audiences[playerId];
-  if (isAudience) return;
+  
+  if (!isAudience) {
+      senderIdx = room.players[playerId] ? room.players[playerId].slot : -1;
+  }
 
-  const senderIdx = room.players[playerId] ? room.players[playerId].slot : -1;
-  if (senderIdx === -1) return;
+  if (msg.type === 'REQUEST_SYNC') {
+      syncGameState(roomCode, playerId, senderIdx, isAudience);
+      return;
+  }
+  
+  if (msg.type === 'ACTION_CHAT') {
+      if (isAudience) return; // Prevent audience from sending chat messages
+      let senderName = 'Unknown';
+      if (room.players[playerId]) senderName = room.players[playerId].name;
+      
+      rm.broadcastToRoom(roomCode, {
+          type: 'GAME_EVENT',
+          event: 'CHAT',
+          payload: { senderName: senderName, message: msg.message }
+      });
+      return;
+  }
+
+  if (msg.type === 'SEND_EMOJI') {
+      let senderName = 'Unknown';
+      if (isAudience && room.audiences[playerId]) senderName = room.audiences[playerId].name;
+      else if (room.players[playerId]) senderName = room.players[playerId].name;
+
+      // Rate limit for audience: 1 emoji per 2 minutes
+      if (isAudience) {
+          room.game.lastEmojiTime = room.game.lastEmojiTime || {};
+          const now = Date.now();
+          const lastTime = room.game.lastEmojiTime[playerId] || 0;
+          if (now - lastTime < 120000) {
+              return; 
+          }
+          room.game.lastEmojiTime[playerId] = now;
+      }
+
+      rm.broadcastToRoom(roomCode, { 
+          type: 'GAME_EVENT', 
+          event: 'EMOJI_SENT', 
+          payload: { playerIdx: senderIdx, emojiId: msg.emojiId, senderName: senderName }
+      });
+      return; 
+  }
+
+  if (isAudience || senderIdx === -1) return;
 
   switch (msg.type) {
     case 'ROLL_DICE': rollDice(roomCode, senderIdx); break;
     case 'MOVE_TOKEN': moveToken(roomCode, senderIdx, msg.tokenId, msg.diceValue, msg.ownerIdx); break;
-    case 'REQUEST_SYNC': syncGameState(roomCode, playerId, senderIdx); break;
     case 'AUDIO_DONE': 
       const isBotTurn = isBot(room, room.game.turnIndex);
       if (senderIdx === room.game.turnIndex || (isBotTurn && senderIdx === 0)) {
@@ -188,9 +231,6 @@ function handleGameAction(roomCode, playerId, msg) {
       break;
     case 'ACTION_RETURN':
       rm.broadcastToRoom(roomCode, { type: 'GAME_EVENT', event: 'PLAYER_RETURN', payload: { playerIdx: senderIdx }});
-      break;
-    case 'SEND_EMOJI':
-      rm.broadcastToRoom(roomCode, { type: 'GAME_EVENT', event: 'EMOJI_SENT', payload: { playerIdx: senderIdx, emojiId: msg.emojiId }});
       break;
   }
 }
@@ -304,7 +344,6 @@ function rollDice(roomCode, playerIdx) {
   const pStats = gs.playerStats[playerIdx];
   const hasRevenge = gs.revengeActive[playerIdx];
 
-  // ── পরিবর্তন: ১০ বার ৬ না উঠলেও এখন ৫০% চান্স ──
   if (hasRevenge) {
       diceVal = chance > 0.7 ? 6 : (Math.floor(chance * 5) + 1);
       gs.revengeActive[playerIdx] = false; 
@@ -451,7 +490,6 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
   if (checkWinCondition(gs, ownerIdx)) {
     if (!gs.winners.includes(ownerIdx)) gs.winners.push(ownerIdx);
     
-    // উইন কন্ডিশন আপডেট: ২ জন খেললে ১ জন জিতলেই গেম ওভার
     if (gs.winners.length >= gs.activePlayerCount - 1 || (gs.playMode === 'team' && checkTeamWin(gs))) {
        prepareStateForAudio(roomCode, () => rm.gameEvent(roomCode, 'GAME_OVER', { winners: gs.winners }));
        rm.gameEvent(roomCode, 'TOKEN_FINISHED', { playerIdx, ownerIdx, tokenId, newPos: move.newPos, diceValue, cutDetails });
@@ -555,7 +593,7 @@ function isBot(room, playerIdx) {
   return pId ? room.players[pId].isBot : false;
 }
 
-function syncGameState(roomCode, playerId, slot) {
+function syncGameState(roomCode, playerId, slot, isAudience) {
   const room = rm.rooms.get(roomCode);
   rm.gameEvent(roomCode, 'SYNC_STATE', {
     turnIndex: room.game.turnIndex,
@@ -569,8 +607,18 @@ function syncGameState(roomCode, playerId, slot) {
     skippedPlayers: room.game.skippedPlayers,
     myPlayerIndex: slot,
     expectedAction: room.game.rollPhase ? 'ROLL' : 'MOVE',
-    actionPlayerIdx: room.game.turnIndex
+    actionPlayerIdx: room.game.turnIndex,
+    isAudience: isAudience !== undefined ? isAudience : false
   }, playerId);
+}
+
+function syncPromotedAudience(roomCode, audienceId, slot) {
+  const room = rm.rooms.get(roomCode);
+  if (!room || !room.game) return;
+  
+  room.game.skippedPlayers[slot] = false;
+  
+  syncGameState(roomCode, audienceId, slot, false);
 }
 
 function handlePlayerDisconnectDuringGame(roomCode, slot) {
@@ -589,4 +637,4 @@ function handlePlayerDisconnectDuringGame(roomCode, slot) {
     }
 }
 
-module.exports = { initGame, handleGameAction, handlePlayerDisconnectDuringGame };
+module.exports = { initGame, handleGameAction, handlePlayerDisconnectDuringGame, syncPromotedAudience };
