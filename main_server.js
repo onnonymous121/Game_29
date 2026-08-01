@@ -40,7 +40,23 @@ httpServer.on('upgrade', (request, socket, head) => {
   });
 });
 
-// ── Updated Login API for Email/Password & Google ──
+// ── NEW: Real-time Username Check API ──
+app.post('/api/check-username', async (req, res) => {
+  const { username } = req.body;
+  try {
+    if (!username) return res.json({ available: false });
+    const existingUsername = await User.findOne({ nickname: username });
+    if (existingUsername) {
+      res.json({ available: false }); // Taken
+    } else {
+      res.json({ available: true }); // Available
+    }
+  } catch (error) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ── Updated Login API ──
 app.post('/api/login', async (req, res) => {
   const { idToken, authType, fullName, userName } = req.body;
   try {
@@ -49,7 +65,6 @@ app.post('/api/login', async (req, res) => {
     if (authType === 'Google' || authType === 'Email') {
       const decodedToken = await getAuth().verifyIdToken(idToken);
       uid = decodedToken.uid;
-      // Use fullName from request (for new Email users) or fallback to token name
       name = fullName || decodedToken.name || 'Player';
     } else {
       return res.status(400).json({ error: 'Invalid authType' });
@@ -88,6 +103,51 @@ app.post('/api/login', async (req, res) => {
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ error: 'Authentication Failed' });
+  }
+});
+
+// ── Profile & Stats / Rank API ──
+app.post('/api/user-stats', async (req, res) => {
+  const { uid } = req.body;
+  try {
+    const user = await User.findOne({ uid });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const higherRankCount = await User.countDocuments({ 
+      $expr: { $gt: [{ $add: ["$xp", { $multiply: ["$level", 1000] }] }, (user.xp + user.level * 1000)] } 
+    });
+    const userRank = higherRankCount + 1;
+
+    const topPlayer = await User.findOne().sort({ xp: -1, level: -1, coins: -1 });
+
+    res.json({
+      success: true,
+      stats: {
+        nickname: user.nickname || user.name,
+        level: user.level,
+        xp: user.xp,
+        coins: user.coins,
+        game29: user.game29Stats,
+        ludo: user.ludoStats,
+        callBreak: user.callBreakStats,
+        rank: userRank,
+        topPlayerName: topPlayer ? (topPlayer.nickname || topPlayer.name) : 'N/A',
+        topPlayerXp: topPlayer ? topPlayer.xp : 0
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch user stats' });
+  }
+});
+
+// ── Delete Account API ──
+app.post('/api/delete-account', async (req, res) => {
+  const { uid } = req.body;
+  try {
+    await User.findOneAndDelete({ uid });
+    res.json({ success: true, message: 'Account deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete account' });
   }
 });
 
@@ -151,45 +211,6 @@ app.post('/api/reward-coins', async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ error: 'Failed to process reward' });
-  }
-});
-
-app.post('/api/transfer-coins', async (req, res) => {
-  const { senderUid, receiverUid, amount } = req.body;
-  
-  try {
-    const transferAmount = parseInt(amount, 10);
-
-    if (!transferAmount || transferAmount <= 0) {
-      return res.status(400).json({ error: 'Invalid amount.' });
-    }
-    if (senderUid === receiverUid) {
-      return res.status(400).json({ error: 'You cannot send coins to yourself.' });
-    }
-
-    const sender = await User.findOne({ uid: senderUid });
-    const receiver = await User.findOne({ uid: receiverUid });
-
-    if (!sender) return res.status(404).json({ error: 'Sender not found.' });
-    if (!receiver) return res.status(404).json({ error: 'Receiver not found. Check the UID.' });
-
-    if (sender.coins < transferAmount) {
-      return res.status(400).json({ error: 'Insufficient coins.' });
-    }
-
-    sender.coins -= transferAmount;
-    receiver.coins += transferAmount;
-
-    await sender.save();
-    await receiver.save();
-
-    res.json({ 
-      success: true, 
-      message: `Successfully sent ${transferAmount} coins to ${receiver.nickname || receiver.name}!`,
-      senderCoins: sender.coins 
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Transfer Failed due to a server error.' });
   }
 });
 
