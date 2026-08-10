@@ -19,6 +19,31 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+// ── DEEP LINKING VERIFICATION (game.omnisent.me) ──
+app.get('/.well-known/assetlinks.json', (req, res) => {
+  res.json([{
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.omnisent.game29",
+      "sha256_cert_fingerprints": ["FA:07:54:16:04:82:C8:D4:86:47:7C:AD:0A:AA:47:53:F7:61:C4:FB:2A:EB:D9:55:30:23:E0:49:AF:75:3D:84"]
+    }
+  }]);
+});
+
+app.get('/.well-known/apple-app-site-association', (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.json({
+    "applinks": {
+      "apps": [],
+      "details": [{
+        "appID": "YOUR_TEAM_ID.com.omnisent.game29", // আইওএস এর জন্য Team ID আপডেট করুন (যদি লাগে)
+        "paths": ["/join/*"]
+      }]
+    }
+  });
+});
+
 const httpServer = createServer(app);
 
 const mongoURI = process.env.MONGO_URI || 'mongodb+srv://aabufaraje_db_user:fkcwg1ErSAU9dTa7@game29.mxv9ojn.mongodb.net/myGameDb?appName=Game29';
