@@ -412,9 +412,24 @@ router.post('/rooms/:code/swap', (req, res) => {
   if (!room) return res.status(404).json({ error: 'Room not found' });
   if (room.hostId !== hostId) return res.status(403).json({ error: 'Not the host' });
 
-  const p1 = room.players[playerId1], p2 = room.players[playerId2];
-  if (!p1 || !p2) return res.status(400).json({ error: 'Player not found' });
-  const tmp = p1.slot; p1.slot = p2.slot; p2.slot = tmp;
+  const p1 = room.players[playerId1];
+  if (!p1) return res.status(400).json({ error: 'Player 1 not found' });
+
+  // ── ফাকা স্লটে যাওয়ার লজিক (Empty Slot Move) ──
+  if (playerId2.startsWith('empty_')) {
+    const targetSlot = parseInt(playerId2.split('_')[1], 10);
+    p1.slot = targetSlot; // Player 1-কে সরাসরি ফাকা স্লটে বসিয়ে দেওয়া হচ্ছে
+  } 
+  // ── অন্য প্লেয়ার বা বটের সাথে অদলবদল (Normal Swap) ──
+  else {
+    const p2 = room.players[playerId2];
+    if (!p2) return res.status(400).json({ error: 'Player 2 not found' });
+    
+    // দুজনের স্লট ইন্টারচেঞ্জ করা হচ্ছে
+    const tmp = p1.slot; 
+    p1.slot = p2.slot; 
+    p2.slot = tmp;
+  }
 
   broadcastRoomUpdate(req.params.code);
   res.json({ success: true });
