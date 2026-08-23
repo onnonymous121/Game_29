@@ -9,6 +9,9 @@ const { parse } = require('url');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getAuth } = require('firebase-admin/auth');
 
+// ── NEW: Agora Token Builder Import ──
+const { RtcTokenBuilder, RtcRole } = require('agora-access-token');
+
 const serviceAccount = require('./serviceAccountKey.json');
 initializeApp({ credential: cert(serviceAccount) });
 
@@ -37,7 +40,7 @@ app.get('/.well-known/apple-app-site-association', (req, res) => {
     "applinks": {
       "apps": [],
       "details": [{
-        "appID": "YOUR_TEAM_ID.com.omnisent.game29", // আইওএস এর জন্য Team ID আপডেট করুন (যদি লাগে)
+        "appID": "YOUR_TEAM_ID.com.omnisent.game29", 
         "paths": ["/join/*"]
       }]
     }
@@ -65,7 +68,38 @@ httpServer.on('upgrade', (request, socket, head) => {
   });
 });
 
-// ── NEW: Real-time Username Check API ──
+// ── NEW: Agora Token Generation API ──
+app.post('/api/agora-token', (req, res) => {
+  const { channelName } = req.body;
+  if (!channelName) {
+    return res.status(400).json({ error: 'channelName is required' });
+  }
+
+  const appID = "a179da78d81548e38972f8594d3b75de";
+  const appCertificate = "3071a080816b491895e3a3fdb8a6f10b";
+  const role = RtcRole.PUBLISHER;
+  const expirationTimeInSeconds = 3600; 
+  const currentTimestamp = Math.floor(Date.now() / 1000);
+  const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
+
+  try {
+    const token = RtcTokenBuilder.buildTokenWithUid(
+      appID, 
+      appCertificate, 
+      channelName, 
+      0, 
+      role, 
+      privilegeExpiredTs
+    );
+    
+    res.json({ success: true, token: token });
+  } catch (error) {
+    console.error('Token generation error:', error);
+    res.status(500).json({ error: 'Failed to generate token' });
+  }
+});
+
+// ── Real-time Username Check API ──
 app.post('/api/check-username', async (req, res) => {
   const { username } = req.body;
   try {
