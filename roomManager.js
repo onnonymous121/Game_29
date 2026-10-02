@@ -553,20 +553,32 @@ function handleWsMessage(socketId, msg) {
         if (senderIdx !== -1) gameEvent(conn.roomCode, 'PLAYER_AWAY_STATE', { slot: senderIdx, isAway: false, playerName: room.players[conn.playerId]?.name });
       }
       return;
-    }case 'ACTION_CHAT': {
+    }
+    case 'ACTION_CHAT': {
       if (conn.roomCode && msg.message) {
         gameEvent(conn.roomCode, 'CHAT', { sender: conn.playerId, message: msg.message });
       }
       return;
     }
-    // ── NEW: VOICE CALL TOGGLE EVENT ──
-    case 'TOGGLE_VOICE_CALL': {
-      if (conn.roomCode && msg.isAllowed !== undefined) {
-          gameEvent(conn.roomCode, 'TOGGLE_VOICE_CALL', { isAllowed: msg.isAllowed });
-      }
-      return;
-    }
-  }e) {
+  }
+
+  const room = rooms.get(conn.roomCode);
+  if (room && AVAILABLE_GAMES[room.gameType]) {
+    AVAILABLE_GAMES[room.gameType].handleGameAction(conn.roomCode, conn.playerId, msg);
+  }
+}
+
+function handleDisconnect(socketId) {
+  const conn = connections.get(socketId);
+  if (!conn) return;
+
+  const { playerId, roomCode, isAudience } = conn;
+
+  if (playerId && playerConnections.get(playerId) === socketId) {
+    playerConnections.delete(playerId);
+  }
+
+  if (playerId && roomCode) {
     const room = rooms.get(roomCode);
     if (room) {
       if (isAudience) {
