@@ -553,18 +553,19 @@ function handleWsMessage(socketId, msg) {
         if (senderIdx !== -1) gameEvent(conn.roomCode, 'PLAYER_AWAY_STATE', { slot: senderIdx, isAway: false, playerName: room.players[conn.playerId]?.name });
       }
       return;
-    }
-    case 'ACTION_CHAT': {
+    }case 'ACTION_CHAT': {
       if (conn.roomCode && msg.message) {
         gameEvent(conn.roomCode, 'CHAT', { sender: conn.playerId, message: msg.message });
       }
       return;
     }
-  }
-
-  const room = rooms.get(conn.roomCode);
-  if (room && AVAILABLE_GAMES[room.gameType]) {
-    AVAILABLE_GAMES[room.gameType].handleGameAction(conn.roomCode, conn.playerId, msg);
+    // ── NEW: VOICE CALL TOGGLE EVENT ──
+    case 'TOGGLE_VOICE_CALL': {
+      if (conn.roomCode && msg.isAllowed !== undefined) {
+          gameEvent(conn.roomCode, 'TOGGLE_VOICE_CALL', { isAllowed: msg.isAllowed });
+      }
+      return;
+    }
   }
 }
 
@@ -574,84 +575,78 @@ function handleDisconnect(socketId) {
 
   const { playerId, roomCode, isAudience } = conn;
 
-  if (playerId && playerConnections.get(playerId) === socketId) {
-    playerConnections.delete(playerId);
-  }
-
-  if (playerId && roomCode) {
-    const room = rooms.get(roomCode);
-    if (room) {
-      if (isAudience) {
-        delete room.audiences[playerId];
-        broadcastRoomUpdate(roomCode);
-      } else if (room.hostId === playerId) {
-        
-        const oldHostSlot = getSlotIndex(room, playerId);
-        let newHostId = null;
-
-        if (oldHostSlot !== -1) {
-          const partnerSlot = (oldHostSlot + 2) % 4;
-          newHostId = Object.keys(room.players).find(pid => room.players[pid].slot === partnerSlot && !room.players[pid].isBot);
-        }
-        if (!newHostId) {
-          newHostId = Object.keys(room.players).find(pid => pid !== playerId && !room.players[pid].isBot);
-        }
-
-        if (newHostId) {
-          room.hostId = newHostId;
-          room.hostName = room.players[newHostId].name;
-          broadcastRoomUpdate(roomCode);
-          gameEvent(roomCode, 'HOST_CHANGED', { newHostId: newHostId, newHostName: room.hostName });
-          gameEvent(roomCode, 'CHAT', { sender: 'SERVER', message: `${room.hostName} is now the Host.` });
-        } else {
-          setTimeout(() => {
-            if (!playerConnections.has(playerId) && rooms.has(roomCode)) {
-              const rCheck = rooms.get(roomCode);
-              const hasHumans = Object.keys(rCheck.players).some(pid => !rCheck.players[pid].isBot);
-              if (!hasHumans) {
-                broadcastToRoom(roomCode, { type: 'ROOM_DELETED', reason: 'Host disconnected and no active players left' });
-                rooms.delete(roomCode);
-              }
-            }
-          }, 15000); 
-        }
-      } 
+  const room = rooms.get(roomCode);
+  if (room) {
+    if (isAudience) {
+      delete room.audiences[playerId];
+      broadcastRoomUpdate(roomCode);
+    } else if (room.hostId === playerId) {
       
-      if (!isAudience) {
-        if (room.game && room.status === 'PLAYING') {
-          const slot = getSlotIndex(room, playerId);
-          gameEvent(roomCode, 'PLAYER_DISCONNECTED', { playerId, slot });
+      const oldHostSlot = getSlotIndex(room, playerId);
+      let newHostId = null;
 
-          setTimeout(() => {
-            if (!playerConnections.has(playerId) && rooms.has(roomCode)) {
-              const r2 = rooms.get(roomCode);
-              if (r2 && r2.players[playerId]) {
-                const s = r2.players[playerId].slot;
-                const pName = r2.players[playerId].name;
+      if (oldHostSlot !== -1) {
+        const partnerSlot = (oldHostSlot + 2) % 4;
+        newHostId = Object.keys(room.players).find(pid => room.players[pid].slot === partnerSlot && !room.players[pid].isBot);
+      }
+      if (!newHostId) {
+        newHostId = Object.keys(room.players).find(pid => pid !== playerId && !room.players[pid].isBot);
+      }
 
-                r2.disconnectedPlayers = r2.disconnectedPlayers || {};
-                r2.disconnectedPlayers[playerId] = { slot: s, name: pName };
+      if (newHostId) {
+        room.hostId = newHostId;
+        room.hostName = room.players[newHostId].name;
+        broadcastRoomUpdate(roomCode);
+        gameEvent(roomCode, 'HOST_CHANGED', { newHostId: newHostId, newHostName: room.hostName });
+        gameEvent(roomCode, 'CHAT', { sender: 'SERVER', message: `${room.hostName} is now the Host.` });
+      } else {
+        setTimeout(() => {
+          if (!playerConnections.has(playerId) && rooms.has(roomCode)) {
+            const rCheck = rooms.get(roomCode);
+            const hasHumans = Object.keys(rCheck.players).some(pid => !rCheck.players[pid].isBot);
+            if (!hasHumans) {
+              broadcastToRoom(roomCode, { type: 'ROOM_DELETED', reason: 'Host disconnected and no active players left' });
+              rooms.delete(roomCode);
+            }
+          }
+        }, 15000); 
+      }
+    } 
+    
+    if (!isAudience) {
+      if (room.game && room.status === 'PLAYING') {
+        const slot = getSlotIndex(room, playerId);
+        gameEvent(roomCode, 'PLAYER_DISCONNECTED', { playerId, slot });
 
-                delete r2.players[playerId];
-                r2.players[`BOT_${s}`] = { name: 'Bot', slot: s, isBot: true };
-                broadcastRoomUpdate(roomCode);
-                gameEvent(roomCode, 'CHAT', { sender: 'SERVER', message: `${pName} disconnected. Bot took over Slot ${s + 1}.` });
+        setTimeout(() => {
+          if (!playerConnections.has(playerId) && rooms.has(roomCode)) {
+            const r2 = rooms.get(roomCode);
+            if (r2 && r2.players[playerId]) {
+              const s = r2.players[playerId].slot;
+              const pName = r2.players[playerId].name;
 
-                const gameModule = AVAILABLE_GAMES[room.gameType];
-                if (gameModule && gameModule.handlePlayerDisconnectDuringGame) {
-                    gameModule.handlePlayerDisconnectDuringGame(roomCode, s);
-                }
+              r2.disconnectedPlayers = r2.disconnectedPlayers || {};
+              r2.disconnectedPlayers[playerId] = { slot: s, name: pName };
+
+              delete r2.players[playerId];
+              r2.players[`BOT_${s}`] = { name: 'Bot', slot: s, isBot: true };
+              broadcastRoomUpdate(roomCode);
+              gameEvent(roomCode, 'CHAT', { sender: 'SERVER', message: `${pName} disconnected. Bot took over Slot ${s + 1}.` });
+
+              const gameModule = AVAILABLE_GAMES[room.gameType];
+              if (gameModule && gameModule.handlePlayerDisconnectDuringGame) {
+                  gameModule.handlePlayerDisconnectDuringGame(roomCode, s);
               }
             }
-          }, 15 * 1000);
-        } else if (room.status === 'WAITING' && room.hostId !== playerId) {
-            setTimeout(() => {
-                if (!playerConnections.has(playerId) && rooms.has(roomCode)) {
-                    delete room.players[playerId];
-                    broadcastRoomUpdate(roomCode);
-                }
-            }, 10000);
-        }
+          }
+        }, 15 * 1000);
+      } else if (room.status === 'WAITING' && room.hostId !== playerId) {
+          setTimeout(() => {
+              if (!playerConnections.has(playerId) && rooms.has(roomCode)) {
+                  delete room.players[playerId];
+                  broadcastRoomUpdate(roomCode);
+              }
+          }, 10000);
       }
     }
   }
