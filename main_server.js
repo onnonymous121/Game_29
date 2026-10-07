@@ -29,7 +29,10 @@ app.get('/.well-known/assetlinks.json', (req, res) => {
     "target": {
       "namespace": "android_app",
       "package_name": "com.omnisent.game29",
-      "sha256_cert_fingerprints": ["FA:07:54:16:04:82:C8:D4:86:47:7C:AD:0A:AA:47:53:F7:61:C4:FB:2A:EB:D9:55:30:23:E0:49:AF:75:3D:84"]
+      "sha256_cert_fingerprints": [
+        "FA:07:54:16:04:82:C8:D4:86:47:7C:AD:0A:AA:47:53:F7:61:C4:FB:2A:EB:D9:55:30:23:E0:49:AF:75:3D:84",
+        "A5:65:AE:A3:D2:A3:66:FC:40:19:5C:64:8D:F0:9A:6F:21:E6:54:4F:E0:7C:CC:71:0E:E8:50:05:2C:EE:E0:7B"
+      ]
     }
   }]);
 });
