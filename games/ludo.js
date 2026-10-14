@@ -1,6 +1,6 @@
 /**
-* Ludo — Core Logic Module
- *Path: games/ludo.js
+ * Ludo — Core Logic Module
+ * Path: games/ludo.js
  */
 
 'use strict';
@@ -11,18 +11,29 @@ const COLORS = ['Red', 'Blue', 'White', 'Green'];
 const SAFE_ZONES = [1, 9, 14, 22, 27, 35, 40, 48]; 
 const START_POSITIONS = { 0: 1, 1: 14, 2: 27, 3: 40 };
 
+// ফাস্ট এবং স্মুথ সার্ভার টাইমিং (মিলিসেকেন্ডে)
+const DELAYS = {
+  GAME_START: 800,
+  DICE_ANIM: 450,
+  TOKEN_MOVE: 450,
+  TOKEN_CUT: 900,
+  TURN_CHANGE: 300,
+  NO_MOVE: 650,
+  BOT_THINK: 650
+};
+
 function newLudoState(playMode) {
   return {
     playMode: playMode, 
     activePlayerCount: 4, 
     turnIndex: 0,
     turnStartTime: Date.now(), 
+    isTurnTimedOut: false,
     pendingDice: [], 
     consecutiveSixes: 0,
     rollPhase: true, 
     winners: [],
-    isWaitingForAudio: false, 
-    pendingAction: null,      
+    isProcessing: false,
     actionTimer: null,
     
     playerStats: [
@@ -31,6 +42,7 @@ function newLudoState(playMode) {
     ],
     revengeActive: [false, false, false, false],
     skippedPlayers: [false, false, false, false], 
+    playerPresence: { 0: 'online', 1: 'online', 2: 'online', 3: 'online' },
 
     tokens: [
       [{ id: 0, pos: -1 }, { id: 1, pos: -1 }, { id: 2, pos: -1 }, { id: 3, pos: -1 }], 
@@ -41,20 +53,39 @@ function newLudoState(playMode) {
   };
 }
 
-// ── TURN TIMER & AUDIO SYNC LOGIC ──
+// ── TURN TIMER & FAST SERVER SCHEDULER ──
 const turnTimers = new Map();
 
+function clearAllTimers(roomCode, gs) {
+  if (turnTimers.has(roomCode)) {
+    clearTimeout(turnTimers.get(roomCode));
+    turnTimers.delete(roomCode);
+  }
+  if (gs && gs.actionTimer) {
+    clearTimeout(gs.actionTimer);
+    gs.actionTimer = null;
+  }
+}
+
 function startTurnTimer(roomCode) {
+  const room = rm.rooms.get(roomCode);
+  if (!room || !room.game) return;
+  const gs = room.game;
+
   if (turnTimers.has(roomCode)) clearTimeout(turnTimers.get(roomCode));
   
-  const room = rm.rooms.get(roomCode);
-  if (room && room.game) {
-    room.game.turnStartTime = Date.now();
-  }
+  gs.turnStartTime = Date.now();
+  gs.isTurnTimedOut = false;
+
   const timer = setTimeout(() => {
     handleTurnTimeout(roomCode);
-  }, 40000); 
+  }, 40000); // সবার জন্য ৪০ সেকেন্ড
   turnTimers.set(roomCode, timer);
+
+  rm.gameEvent(roomCode, 'TIMER_STARTED', { 
+    turnStartTime: gs.turnStartTime,
+    isTurnTimedOut: false 
+  });
 }
 
 function handleTurnTimeout(roomCode) {
@@ -62,49 +93,46 @@ function handleTurnTimeout(roomCode) {
   if (!room || !room.game) return;
   const gs = room.game;
   
-  rm.gameEvent(roomCode, 'TURN_TIMEOUT', { turnIndex: gs.turnIndex });
-  changeTurn(roomCode);
+  // ৪০ সেকেন্ড শেষ হলে যদি বট হয় তবে বট চাল দিয়ে দেবে, কিন্তু মানুষ হলে অটোমেটিক টার্ন পরিবর্তন হবে না।
+  // হোস্ট চাইলে চাল স্কিপ করতে পারবে বা প্লেয়ারকে ডিসকানেক্ট করতে পারবে।
+  if (isBot(room, gs.turnIndex)) {
+    checkBotTurn(roomCode);
+    return;
+  }
+
+  gs.isTurnTimedOut = true;
+  rm.gameEvent(roomCode, 'TURN_TIMEOUT', { 
+    turnIndex: gs.turnIndex,
+    isTurnTimedOut: true 
+  });
 }
 
-function prepareStateForAudio(roomCode, pendingActionFn) {
+function scheduleNextStep(roomCode, nextActionFn, delayMs = 450) {
   const room = rm.rooms.get(roomCode);
   if (!room || !room.game) return;
-  
-  if (turnTimers.has(roomCode)) clearTimeout(turnTimers.get(roomCode));
-  if (room.game.actionTimer) clearTimeout(room.game.actionTimer);
-  
-  room.game.isWaitingForAudio = true;
-  room.game.pendingAction = pendingActionFn || null;
-  
-  room.game.actionTimer = setTimeout(() => {
-      forceAudioDone(roomCode);
-  }, 6000);
-}
+  const gs = room.game;
 
-function handleAudioDoneSignal(roomCode) {
-  const room = rm.rooms.get(roomCode);
-  if (!room || !room.game || !room.game.isWaitingForAudio) return; 
-  forceAudioDone(roomCode);
-}
+  clearAllTimers(roomCode, gs);
 
-function forceAudioDone(roomCode) {
-  const room = rm.rooms.get(roomCode);
-  if (!room || !room.game) return;
-  
-  room.game.isWaitingForAudio = false;
-  if (room.game.actionTimer) clearTimeout(room.game.actionTimer);
-
-  if (room.game.pendingAction) {
-      const fn = room.game.pendingAction;
-      room.game.pendingAction = null;
-      fn(); 
+  if (nextActionFn) {
+    gs.isProcessing = true;
+    gs.actionTimer = setTimeout(() => {
+      if (!rm.rooms.has(roomCode) || !room.game) return;
+      gs.isProcessing = false;
+      gs.actionTimer = null;
+      nextActionFn();
+    }, delayMs);
   } else {
-      if (isBot(room, room.game.turnIndex)) {
-          checkBotTurn(roomCode);
-      } else {
-          startTurnTimer(roomCode);
-          rm.gameEvent(roomCode, 'TIMER_STARTED', { turnStartTime: room.game.turnStartTime });
-      }
+    gs.isProcessing = false;
+    if (isBot(room, gs.turnIndex)) {
+      gs.actionTimer = setTimeout(() => {
+        if (!rm.rooms.has(roomCode) || !room.game) return;
+        gs.actionTimer = null;
+        checkBotTurn(roomCode);
+      }, DELAYS.BOT_THINK);
+    } else {
+      startTurnTimer(roomCode);
+    }
   }
 }
 
@@ -117,10 +145,14 @@ function initGame(roomCode) {
   const activeSlots = [];
   
   Object.keys(room.players).forEach(pid => {
-      activeSlots.push(room.players[pid].slot);
+      const s = room.players[pid].slot;
+      activeSlots.push(s);
       if (room.players[pid].isBot) {
           room.players[pid].name = `Bot ${botCount}`;
+          room.game.playerPresence[s] = 'bot';
           botCount++;
+      } else {
+          room.game.playerPresence[s] = 'online';
       }
   });
 
@@ -130,6 +162,7 @@ function initGame(roomCode) {
       if (!activeSlots.includes(i)) {
           room.game.skippedPlayers[i] = true;
           room.game.tokens[i] = []; 
+          room.game.playerPresence[i] = 'empty';
       }
   }
 
@@ -142,12 +175,6 @@ function initGame(roomCode) {
       } while (room.game.skippedPlayers[room.game.turnIndex]);
   }
 
-  let nextAction = null;
-  if (isBot(room, room.game.turnIndex)) {
-      nextAction = () => rollDice(roomCode, room.game.turnIndex);
-  }
-  prepareStateForAudio(roomCode, nextAction);
-
   rm.broadcastToRoom(roomCode, { 
     type: 'GAME_EVENT', 
     event: 'GAME_STARTED', 
@@ -156,15 +183,24 @@ function initGame(roomCode) {
         playMode: room.playMode, 
         players: room.players,
         skippedPlayers: room.game.skippedPlayers,
+        playerPresence: room.game.playerPresence,
+        isTurnTimedOut: false,
         expectedAction: 'ROLL',
         actionPlayerIdx: room.game.turnIndex
     } 
   });
+
+  let nextAction = null;
+  if (isBot(room, room.game.turnIndex)) {
+      nextAction = () => rollDice(roomCode, room.game.turnIndex);
+  }
+  scheduleNextStep(roomCode, nextAction, DELAYS.GAME_START);
 }
 
 function handleGameAction(roomCode, playerId, msg) {
   const room = rm.rooms.get(roomCode);
   if (!room || !room.game) return;
+  const gs = room.game;
   
   let senderIdx = -1;
   const isAudience = !!room.audiences[playerId];
@@ -179,7 +215,7 @@ function handleGameAction(roomCode, playerId, msg) {
   }
   
   if (msg.type === 'ACTION_CHAT') {
-      if (isAudience) return; // Prevent audience from sending chat messages
+      if (isAudience) return;
       let senderName = 'Unknown';
       if (room.players[playerId]) senderName = room.players[playerId].name;
       
@@ -196,7 +232,6 @@ function handleGameAction(roomCode, playerId, msg) {
       if (isAudience && room.audiences[playerId]) senderName = room.audiences[playerId].name;
       else if (room.players[playerId]) senderName = room.players[playerId].name;
 
-      // Rate limit for audience: 1 emoji per 2 minutes
       if (isAudience) {
           room.game.lastEmojiTime = room.game.lastEmojiTime || {};
           const now = Date.now();
@@ -215,24 +250,94 @@ function handleGameAction(roomCode, playerId, msg) {
       return; 
   }
 
+  // ── হোস্ট কন্ট্রোল: ৪০ সেকেন্ড পর চাল পাস করা বা প্লেয়ারকে ডিসকানেক্ট করা ──
+  if (msg.type === 'HOST_SKIP_TURN') {
+      if (room.hostId !== playerId) return;
+      const targetSlot = msg.targetSlot !== undefined ? Number(msg.targetSlot) : gs.turnIndex;
+      if (gs.turnIndex === targetSlot && gs.isTurnTimedOut) {
+          clearAllTimers(roomCode, gs);
+          gs.isTurnTimedOut = false;
+          const pName = getPlayerNameBySlot(room, targetSlot);
+          rm.gameEvent(roomCode, 'HOST_ACTION_NOTICE', {
+              action: 'SKIP_TURN',
+              slot: targetSlot,
+              playerName: pName
+          });
+          changeTurn(roomCode);
+      }
+      return;
+  }
+
+  if (msg.type === 'HOST_KICK_PLAYER') {
+      if (room.hostId !== playerId) return;
+      const targetSlot = Number(msg.targetSlot);
+      if (isNaN(targetSlot) || targetSlot < 0 || targetSlot > 3) return;
+      if (targetSlot === senderIdx) return; // হোস্ট নিজেকে কিক করতে পারবে না
+
+      const targetPid = Object.keys(room.players).find(
+          pid => room.players[pid].slot === targetSlot && !room.players[pid].isBot
+      );
+      if (!targetPid) return;
+
+      const kickedName = room.players[targetPid].name;
+      room.disconnectedPlayers = room.disconnectedPlayers || {};
+      room.disconnectedPlayers[targetPid] = { slot: targetSlot, name: kickedName };
+      delete room.players[targetPid];
+
+      if (gs.playMode === 'team') {
+          room.players[`BOT_${targetSlot}`] = { name: `Bot ${targetSlot + 1}`, slot: targetSlot, isBot: true };
+          gs.playerPresence[targetSlot] = 'bot';
+      } else {
+          gs.skippedPlayers[targetSlot] = true;
+          gs.tokens[targetSlot] = [];
+          gs.playerPresence[targetSlot] = 'disconnected';
+          const remainingActive = [0, 1, 2, 3].filter(i => !gs.skippedPlayers[i]).length;
+          gs.activePlayerCount = Math.max(2, remainingActive);
+      }
+
+      rm.broadcastRoomUpdate(roomCode);
+      rm.gameEvent(roomCode, 'PLAYER_KICKED_BY_HOST', {
+          slot: targetSlot,
+          playerName: kickedName,
+          players: room.players,
+          skippedPlayers: gs.skippedPlayers,
+          playerPresence: gs.playerPresence
+      });
+
+      if (gs.turnIndex === targetSlot) {
+          clearAllTimers(roomCode, gs);
+          gs.isTurnTimedOut = false;
+          if (gs.playMode === 'team') {
+              scheduleNextStep(roomCode, () => checkBotTurn(roomCode), DELAYS.BOT_THINK);
+          } else {
+              changeTurn(roomCode);
+          }
+      }
+      return;
+  }
+
   if (isAudience || senderIdx === -1) return;
 
   switch (msg.type) {
     case 'ROLL_DICE': rollDice(roomCode, senderIdx); break;
     case 'MOVE_TOKEN': moveToken(roomCode, senderIdx, msg.tokenId, msg.diceValue, msg.ownerIdx); break;
     case 'AUDIO_DONE': 
-      const isBotTurn = isBot(room, room.game.turnIndex);
-      if (senderIdx === room.game.turnIndex || (isBotTurn && senderIdx === 0)) {
-          handleAudioDoneSignal(roomCode);
-      }
+      // সার্ভার এখন আর ক্লায়েন্টের অডিও শেষ হওয়ার জন্য গেম ব্লক করে রাখবে না
       break;
     case 'ACTION_AWAY':
-      rm.broadcastToRoom(roomCode, { type: 'GAME_EVENT', event: 'PLAYER_AWAY', payload: { playerIdx: senderIdx }});
+      gs.playerPresence[senderIdx] = 'away';
+      rm.broadcastToRoom(roomCode, { type: 'GAME_EVENT', event: 'PLAYER_AWAY', payload: { playerIdx: senderIdx, playerPresence: gs.playerPresence }});
       break;
     case 'ACTION_RETURN':
-      rm.broadcastToRoom(roomCode, { type: 'GAME_EVENT', event: 'PLAYER_RETURN', payload: { playerIdx: senderIdx }});
+      gs.playerPresence[senderIdx] = 'online';
+      rm.broadcastToRoom(roomCode, { type: 'GAME_EVENT', event: 'PLAYER_RETURN', payload: { playerIdx: senderIdx, playerPresence: gs.playerPresence }});
       break;
   }
+}
+
+function getPlayerNameBySlot(room, slot) {
+  const pid = Object.keys(room.players).find(id => room.players[id].slot === slot);
+  return pid ? room.players[pid].name : `Player ${slot + 1}`;
 }
 
 function getGlobalPosition(playerIdx, relativePos) {
@@ -334,9 +439,13 @@ function checkAndCutTokenSimulation(gs, attackerIdx, globalPos) {
 
 function rollDice(roomCode, playerIdx) {
   const room = rm.rooms.get(roomCode);
+  if (!room || !room.game) return;
   const gs = room.game;
 
-  if (gs.turnIndex !== playerIdx || !gs.rollPhase) return;
+  if (gs.turnIndex !== playerIdx || !gs.rollPhase || gs.isProcessing) return;
+
+  clearAllTimers(roomCode, gs);
+  gs.isTurnTimedOut = false;
 
   let chance = Math.random();
   let diceVal = Math.floor(chance * 6) + 1; 
@@ -369,8 +478,6 @@ function rollDice(roomCode, playerIdx) {
     gs.consecutiveSixes = 0;
     gs.pendingDice = [];
     gs.rollPhase = false;
-    
-    prepareStateForAudio(roomCode, () => changeTurn(roomCode));
 
     rm.gameEvent(roomCode, 'DICE_ROLLED', { 
       diceValue: 6, 
@@ -382,6 +489,8 @@ function rollDice(roomCode, playerIdx) {
       expectedAction: 'NONE',
       actionPlayerIdx: playerIdx
     });
+
+    scheduleNextStep(roomCode, () => changeTurn(roomCode), DELAYS.NO_MOVE);
     return;
   }
   
@@ -391,30 +500,34 @@ function rollDice(roomCode, playerIdx) {
   }
 
   let expectedAction = 'NONE';
-  let pendingAction = null;
+  let nextAction = null;
+  let stepDelay = DELAYS.DICE_ANIM;
 
   if (gs.rollPhase) {
       expectedAction = 'ROLL';
-      if (isBot(room, playerIdx)) pendingAction = () => rollDice(roomCode, playerIdx);
+      if (isBot(room, playerIdx)) {
+          nextAction = () => rollDice(roomCode, playerIdx);
+          stepDelay = DELAYS.BOT_THINK;
+      }
   } else if (validMovesDetails.length > 0) {
       expectedAction = validMovesDetails.length > 1 ? 'MOVE' : 'NONE';
       
       if (isBot(room, playerIdx) || validMovesDetails.length === 1) {
-          pendingAction = () => {
+          nextAction = () => {
               const move = isBot(room, playerIdx) 
                   ? (validMovesDetails.find(m => m.isUnlock) || validMovesDetails.find(m => m.killVictimIdx !== -1) || validMovesDetails[0])
                   : validMovesDetails[0];
               moveToken(roomCode, playerIdx, move.tokenId, move.diceValue, move.ownerIdx);
           };
+          stepDelay = isBot(room, playerIdx) ? DELAYS.BOT_THINK : DELAYS.DICE_ANIM;
       }
   } else {
-      pendingAction = () => {
-        rm.gameEvent(roomCode, 'NO_VALID_MOVE', {});
-        prepareStateForAudio(roomCode, () => changeTurn(roomCode));
+      nextAction = () => {
+        rm.gameEvent(roomCode, 'NO_VALID_MOVE', { playerIdx });
+        scheduleNextStep(roomCode, () => changeTurn(roomCode), DELAYS.TURN_CHANGE);
       };
+      stepDelay = DELAYS.NO_MOVE;
   }
-
-  prepareStateForAudio(roomCode, pendingAction);
 
   rm.gameEvent(roomCode, 'DICE_ROLLED', { 
     diceValue: diceVal, 
@@ -426,13 +539,16 @@ function rollDice(roomCode, playerIdx) {
     expectedAction: expectedAction,
     actionPlayerIdx: playerIdx
   });
+
+  scheduleNextStep(roomCode, nextAction, stepDelay);
 }
 
 function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
   const room = rm.rooms.get(roomCode);
+  if (!room || !room.game) return;
   const gs = room.game;
   
-  if (gs.turnIndex !== playerIdx || gs.rollPhase || gs.pendingDice.length === 0) return;
+  if (gs.turnIndex !== playerIdx || gs.rollPhase || gs.pendingDice.length === 0 || gs.isProcessing) return;
 
   if (ownerIdx === undefined) ownerIdx = playerIdx;
   if (gs.playMode !== 'team' && ownerIdx !== playerIdx) return;
@@ -441,6 +557,9 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
   const validMoves = getValidMovesDetails(gs, playerIdx);
   const move = validMoves.find(m => m.ownerIdx === ownerIdx && m.tokenId === tokenId && m.diceValue === diceValue);
   if (!move) return;
+
+  clearAllTimers(roomCode, gs);
+  gs.isTurnTimedOut = false;
 
   const diceIndex = gs.pendingDice.indexOf(diceValue);
   if (diceIndex > -1) {
@@ -491,8 +610,13 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
     if (!gs.winners.includes(ownerIdx)) gs.winners.push(ownerIdx);
     
     if (gs.winners.length >= gs.activePlayerCount - 1 || (gs.playMode === 'team' && checkTeamWin(gs))) {
-       prepareStateForAudio(roomCode, () => rm.gameEvent(roomCode, 'GAME_OVER', { winners: gs.winners }));
        rm.gameEvent(roomCode, 'TOKEN_FINISHED', { playerIdx, ownerIdx, tokenId, newPos: move.newPos, diceValue, cutDetails });
+       scheduleNextStep(roomCode, () => {
+         rm.gameEvent(roomCode, 'GAME_OVER', { winners: gs.winners });
+         if (rm.resolveUniversalGame) {
+           rm.resolveUniversalGame(roomCode, gs.winners);
+         }
+       }, DELAYS.TOKEN_MOVE);
        return;
     }
   }
@@ -503,27 +627,31 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
   }
 
   let expectedAction = 'NONE';
-  let pendingAction = null;
+  let nextAction = null;
+  let stepDelay = cutDetails ? DELAYS.TOKEN_CUT : DELAYS.TOKEN_MOVE;
 
   if (gs.rollPhase) {
       expectedAction = 'ROLL';
-      if (isBot(room, playerIdx)) pendingAction = () => rollDice(roomCode, playerIdx);
+      if (isBot(room, playerIdx)) {
+          nextAction = () => rollDice(roomCode, playerIdx);
+          stepDelay = DELAYS.BOT_THINK;
+      }
   } else if (remainingMoves.length > 0) {
       expectedAction = remainingMoves.length > 1 ? 'MOVE' : 'NONE';
       
       if (isBot(room, playerIdx) || remainingMoves.length === 1) {
-          pendingAction = () => {
+          nextAction = () => {
               const nextMove = isBot(room, playerIdx) 
                   ? (remainingMoves.find(m => m.isUnlock) || remainingMoves.find(m => m.killVictimIdx !== -1) || remainingMoves[0])
                   : remainingMoves[0];
               moveToken(roomCode, playerIdx, nextMove.tokenId, nextMove.diceValue, nextMove.ownerIdx);
           };
+          stepDelay = isBot(room, playerIdx) ? DELAYS.BOT_THINK : DELAYS.TOKEN_MOVE;
       }
   } else {
-      pendingAction = () => changeTurn(roomCode);
+      nextAction = () => changeTurn(roomCode);
+      stepDelay = cutDetails ? DELAYS.TOKEN_CUT : DELAYS.TURN_CHANGE;
   }
-
-  prepareStateForAudio(roomCode, pendingAction);
 
   rm.gameEvent(roomCode, eventType, { 
       playerIdx, 
@@ -532,20 +660,26 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
       newPos: move.newPos, 
       diceValue, 
       cutDetails,
+      isSafeZone: move.isSafeZone,
       pendingDice: gs.pendingDice,
       rollPhase: gs.rollPhase,
       validMoves: remainingMoves,
       expectedAction: expectedAction,
       actionPlayerIdx: playerIdx
   });
+
+  scheduleNextStep(roomCode, nextAction, stepDelay);
 }
 
 function changeTurn(roomCode) {
   const room = rm.rooms.get(roomCode);
+  if (!room || !room.game) return;
   const gs = room.game;
+
   gs.pendingDice = [];
   gs.consecutiveSixes = 0;
   gs.rollPhase = true; 
+  gs.isTurnTimedOut = false;
   
   let loopCount = 0;
   do { 
@@ -554,18 +688,19 @@ function changeTurn(roomCode) {
       if(loopCount > 4) break; 
   } while (gs.winners.includes(gs.turnIndex) || gs.skippedPlayers[gs.turnIndex]);
   
-  let pendingAction = null;
-  if (isBot(room, gs.turnIndex)) {
-      pendingAction = () => rollDice(roomCode, gs.turnIndex);
-  }
-
-  prepareStateForAudio(roomCode, pendingAction);
-
   rm.gameEvent(roomCode, 'TURN_CHANGED', { 
       turnIndex: gs.turnIndex,
+      isTurnTimedOut: false,
       expectedAction: 'ROLL',
       actionPlayerIdx: gs.turnIndex
   });
+
+  let nextAction = null;
+  if (isBot(room, gs.turnIndex)) {
+      nextAction = () => rollDice(roomCode, gs.turnIndex);
+  }
+
+  scheduleNextStep(roomCode, nextAction, DELAYS.TURN_CHANGE);
 }
 
 function checkBotTurn(roomCode) {
@@ -586,7 +721,7 @@ function checkBotTurn(roomCode) {
   }
 }
 
-function checkWinCondition(gs, playerIdx) { return gs.tokens[playerIdx].every(t => t.pos === 57); }
+function checkWinCondition(gs, playerIdx) { return gs.tokens[playerIdx].length > 0 && gs.tokens[playerIdx].every(t => t.pos === 57); }
 function checkTeamWin(gs) { return (checkWinCondition(gs, 0) && checkWinCondition(gs, 2)) || (checkWinCondition(gs, 1) && checkWinCondition(gs, 3)); }
 function isBot(room, playerIdx) {
   const pId = Object.keys(room.players).find(id => room.players[id].slot === playerIdx);
@@ -595,19 +730,33 @@ function isBot(room, playerIdx) {
 
 function syncGameState(roomCode, playerId, slot, isAudience) {
   const room = rm.rooms.get(roomCode);
+  if (!room || !room.game) return;
+  const gs = room.game;
+
+  if (slot !== -1 && !isAudience) {
+    gs.playerPresence[slot] = 'online';
+  }
+
+  const currentValidMoves = (!isAudience && slot === gs.turnIndex && !gs.rollPhase)
+      ? getValidMovesDetails(gs, slot)
+      : [];
+
   rm.gameEvent(roomCode, 'SYNC_STATE', {
-    turnIndex: room.game.turnIndex,
-    turnStartTime: room.game.turnStartTime,
-    tokens: room.game.tokens,
-    winners: room.game.winners,
-    playMode: room.game.playMode,
-    pendingDice: room.game.pendingDice,
-    rollPhase: room.game.rollPhase,
+    turnIndex: gs.turnIndex,
+    turnStartTime: gs.turnStartTime,
+    isTurnTimedOut: gs.isTurnTimedOut,
+    tokens: gs.tokens,
+    winners: gs.winners,
+    playMode: gs.playMode,
+    pendingDice: gs.pendingDice,
+    rollPhase: gs.rollPhase,
     players: room.players, 
-    skippedPlayers: room.game.skippedPlayers,
+    skippedPlayers: gs.skippedPlayers,
+    playerPresence: gs.playerPresence,
+    validMoves: currentValidMoves,
     myPlayerIndex: slot,
-    expectedAction: room.game.rollPhase ? 'ROLL' : 'MOVE',
-    actionPlayerIdx: room.game.turnIndex,
+    expectedAction: gs.rollPhase ? 'ROLL' : 'MOVE',
+    actionPlayerIdx: gs.turnIndex,
     isAudience: isAudience !== undefined ? isAudience : false
   }, playerId);
 }
@@ -617,6 +766,12 @@ function syncPromotedAudience(roomCode, audienceId, slot) {
   if (!room || !room.game) return;
   
   room.game.skippedPlayers[slot] = false;
+  room.game.playerPresence[slot] = 'online';
+  if (room.game.tokens[slot].length === 0) {
+    room.game.tokens[slot] = [
+      { id: 0, pos: -1 }, { id: 1, pos: -1 }, { id: 2, pos: -1 }, { id: 3, pos: -1 }
+    ];
+  }
   
   syncGameState(roomCode, audienceId, slot, false);
 }
@@ -624,16 +779,20 @@ function syncPromotedAudience(roomCode, audienceId, slot) {
 function handlePlayerDisconnectDuringGame(roomCode, slot) {
     const room = rm.rooms.get(roomCode);
     if (!room || !room.game) return;
+    const gs = room.game;
 
-    if (room.game.playMode === 'team') {
+    if (gs.playMode === 'team') {
+        gs.playerPresence[slot] = 'bot';
         checkBotTurn(roomCode);
     } else {
-        room.game.skippedPlayers[slot] = true;
-        
-        if (room.game.turnIndex === slot) {
-            if (room.game.actionTimer) clearTimeout(room.game.actionTimer);
-            changeTurn(roomCode);
-        }
+        // ৪০ সেকেন্ডের লজিক অনুযায়ী প্লেয়ারের নাম ও স্ট্যাটাস অফলাইন দেখানো হবে,
+        // যাতে হোস্ট নিজে সিদ্ধান্ত নিতে পারে তাকে কিক করবে নাকি চাল পাস করবে।
+        gs.playerPresence[slot] = 'disconnected';
+        rm.gameEvent(roomCode, 'PLAYER_PRESENCE_UPDATED', {
+            slot: slot,
+            status: 'disconnected',
+            playerPresence: gs.playerPresence
+        });
     }
 }
 
