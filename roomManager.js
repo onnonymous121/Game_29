@@ -1,7 +1,7 @@
 /**
  * Universal Room Manager
  * =====================================================
- * এটি সমস্ত গেমের (Game 29, Ludo, CallBreak)ルーム コントロール এবং সেন্ট্রাল ইকোনমি হ্যান্ডেল করবে।
+ * এটি সমস্ত গেমের (Game 29, Ludo, CallBreak) রুম কন্ট্রোল এবং সেন্ট্রাল ইকোনমি হ্যান্ডেল করবে।
  */
 
 'use strict';
@@ -97,6 +97,53 @@ function gameEvent(roomCode, event, payload, targetPlayerId = null) {
   else broadcastToRoom(roomCode, msg);
 }
 
+// ── NEW: Check if at least one real human player is online and active in the room ──
+function hasActiveHumanPlayer(room) {
+  if (!room || !room.players) return false;
+  return Object.keys(room.players).some((pid) => {
+    const p = room.players[pid];
+    if (!p || p.isBot) return false;
+    const sid = playerConnections.get(pid);
+    if (!sid) return false;
+    const conn = connections.get(sid);
+    return conn && conn.ws && conn.ws.readyState === WebSocket.OPEN && !conn.isAway;
+  });
+}
+
+// ── NEW: Update room activity status & track when it becomes empty of active humans ──
+function updateRoomActivity(roomCode) {
+  const room = rooms.get(roomCode);
+  if (!room) return;
+  if (hasActiveHumanPlayer(room)) {
+    room.emptySince = null;
+  } else {
+    if (!room.emptySince) {
+      room.emptySince = Date.now();
+    }
+  }
+}
+
+// ── NEW: Background interval that deletes any room with no active human for > 5 minutes ──
+const INACTIVE_ROOM_TIMEOUT_MS = 5 * 60 * 1000; // 5 Minutes
+setInterval(() => {
+  const now = Date.now();
+  rooms.forEach((room, roomCode) => {
+    if (hasActiveHumanPlayer(room)) {
+      room.emptySince = null;
+    } else {
+      if (!room.emptySince) {
+        room.emptySince = now;
+      } else if (now - room.emptySince >= INACTIVE_ROOM_TIMEOUT_MS) {
+        broadcastToRoom(roomCode, {
+          type: 'ROOM_DELETED',
+          reason: 'No active human players for 5 minutes',
+        });
+        rooms.delete(roomCode);
+      }
+    }
+  });
+}, 15 * 1000); // প্রতি ১৫ সেকেন্ডে চেক করবে
+
 module.exports.broadcastToRoom = broadcastToRoom;
 module.exports.broadcastRoomUpdate = broadcastRoomUpdate;
 module.exports.gameEvent = gameEvent;
@@ -168,6 +215,7 @@ async function resolveUniversalGame(roomCode, winnerSlotsArray) {
     results: results
   });
   broadcastRoomUpdate(roomCode);
+  updateRoomActivity(roomCode);
 }
 
 module.exports.resolveUniversalGame = resolveUniversalGame;
@@ -187,6 +235,12 @@ router.get('/rooms', (req, res) => {
   rooms.forEach((room, code) => {
     if (room.type !== 'public') return;
     if (gameType && room.gameType !== gameType && gameType !== 'all') return; 
+
+    // যদি ৫ মিনিটের বেশি সময় ধরে কোনো অ্যাক্টিভ হিউম্যান না থাকে, তবে লিস্টেও দেখাবে না এবং ডিলিট করে দেবে
+    if (!hasActiveHumanPlayer(room) && room.emptySince && (Date.now() - room.emptySince >= INACTIVE_ROOM_TIMEOUT_MS)) {
+      rooms.delete(code);
+      return;
+    }
 
     const playerCount = Object.keys(room.players).length;
     const canJoin = (room.status === 'WAITING' && (playerCount < 4 || room.allowAudience))
@@ -237,6 +291,7 @@ router.post('/rooms/create', (req, res) => {
     playMode: finalPlayMode,
     allowAudience: allowAudience !== false,
     sessionId: null, createdAt: Date.now(),
+    emptySince: null,
     players: { [playerId]: { name: playerName, slot: 0, isBot: false } },
     requests: {}, audiences: {},
     game: null,
@@ -259,6 +314,7 @@ router.post('/rooms/:code/join', (req, res) => {
       delete room.players[`BOT_${oldData.slot}`];
       room.players[playerId] = { name: playerName, slot: oldData.slot, isBot: false };
       delete room.disconnectedPlayers[playerId];
+      room.emptySince = null;
       broadcastRoomUpdate(req.params.code);
       gameEvent(req.params.code, 'CHAT', { sender: 'SERVER', message: `${playerName} rejoined the game and took back their seat.` });
       gameEvent(req.params.code, 'PLAYER_REJOINED', { playerId, slot: oldData.slot, playerName });
@@ -306,6 +362,7 @@ router.post('/rooms/:code/admit', (req, res) => {
 
   delete room.requests[playerId];
   room.players[playerId] = { name: req2.name, slot, isBot: false };
+  updateRoomActivity(req.params.code);
   broadcastRoomUpdate(req.params.code);
   res.json({ success: true });
 });
@@ -360,12 +417,10 @@ router.post('/rooms/:code/start', async (req, res) => {
 
   room.prizePool = totalPrizePool; 
 
-  // UPDATED: এখানে থাকা জোরপূর্বক বট অটো-ফিল লজিকটি (for loop) রিমুভ করা হয়েছে। 
-  // এখন ব্যবহারকারী লবি থেকে যে কয়টি বট বা প্লেয়ার সিলেক্ট করবে, শুধু তাদের নিয়েই গেম স্টার্ট হবে।
-
   const sid = sessionId || crypto.randomUUID();
   room.sessionId = sid;
   room.status = 'PLAYING';
+  updateRoomActivity(req.params.code);
   broadcastRoomUpdate(req.params.code);
 
   const gameModule = AVAILABLE_GAMES[room.gameType];
@@ -388,6 +443,7 @@ router.delete('/rooms/:code', (req, res) => {
     delete room.players[playerId];
     delete room.audiences[playerId];
     delete room.requests[playerId];
+    updateRoomActivity(req.params.code);
     broadcastRoomUpdate(req.params.code);
   }
   res.json({ success: true });
@@ -415,17 +471,13 @@ router.post('/rooms/:code/swap', (req, res) => {
   const p1 = room.players[playerId1];
   if (!p1) return res.status(400).json({ error: 'Player 1 not found' });
 
-  // ── ফাকা স্লটে যাওয়ার লজিক (Empty Slot Move) ──
   if (playerId2.startsWith('empty_')) {
     const targetSlot = parseInt(playerId2.split('_')[1], 10);
-    p1.slot = targetSlot; // Player 1-কে সরাসরি ফাকা স্লটে বসিয়ে দেওয়া হচ্ছে
-  } 
-  // ── অন্য প্লেয়ার বা বটের সাথে অদলবদল (Normal Swap) ──
-  else {
+    p1.slot = targetSlot;
+  } else {
     const p2 = room.players[playerId2];
     if (!p2) return res.status(400).json({ error: 'Player 2 not found' });
     
-    // দুজনের স্লট ইন্টারচেঞ্জ করা হচ্ছে
     const tmp = p1.slot; 
     p1.slot = p2.slot; 
     p2.slot = tmp;
@@ -463,6 +515,7 @@ router.post('/rooms/:code/promote', (req, res) => {
     if (conn) conn.isAudience = false;
   }
 
+  updateRoomActivity(req.params.code);
   broadcastRoomUpdate(req.params.code);
   gameEvent(req.params.code, 'CHAT', { sender: 'SERVER', message: `${audienceName} replaced Bot in Slot ${targetSlot + 1}` });
 
@@ -485,6 +538,7 @@ router.post('/rooms/:code/replace_bot', (req, res) => {
   });
   room.players[`BOT_${slot}`] = { name: 'Bot', slot: Number(slot), isBot: true };
 
+  updateRoomActivity(req.params.code);
   broadcastRoomUpdate(req.params.code);
   res.json({ success: true });
 });
@@ -494,7 +548,7 @@ router.post('/rooms/:code/replace_bot', (req, res) => {
 // ============================================================
 function handleConnection(ws) {
   const socketId = crypto.randomUUID();
-  connections.set(socketId, { ws, playerId: null, roomCode: null, isAudience: false });
+  connections.set(socketId, { ws, playerId: null, roomCode: null, isAudience: false, isAway: false });
   ws.send(JSON.stringify({ type: 'CONNECTED', socketId }));
 
   ws.on('message', (raw) => {
@@ -526,8 +580,11 @@ function handleWsMessage(socketId, msg) {
       conn.playerId = playerId;
       conn.roomCode = roomCode;
       conn.isAudience = isAudience || false;
+      conn.isAway = false;
       playerConnections.set(playerId, socketId);
       
+      updateRoomActivity(roomCode);
+
       if (conn.ws && conn.ws.readyState === WebSocket.OPEN) {
         conn.ws.send(JSON.stringify({ type: 'REGISTERED', playerId, roomCode }));
       }
@@ -539,18 +596,22 @@ function handleWsMessage(socketId, msg) {
       }
       return;
     case 'ACTION_AWAY': {
+      conn.isAway = true;
       const room = rooms.get(conn.roomCode);
       if (room) {
         const senderIdx = getSlotIndex(room, conn.playerId);
         if (senderIdx !== -1) gameEvent(conn.roomCode, 'PLAYER_AWAY_STATE', { slot: senderIdx, isAway: true, playerName: room.players[conn.playerId]?.name });
+        updateRoomActivity(conn.roomCode);
       }
       return;
     }
     case 'ACTION_RETURN': {
+      conn.isAway = false;
       const room = rooms.get(conn.roomCode);
       if (room) {
         const senderIdx = getSlotIndex(room, conn.playerId);
         if (senderIdx !== -1) gameEvent(conn.roomCode, 'PLAYER_AWAY_STATE', { slot: senderIdx, isAway: false, playerName: room.players[conn.playerId]?.name });
+        updateRoomActivity(conn.roomCode);
       }
       return;
     }
@@ -565,6 +626,7 @@ function handleWsMessage(socketId, msg) {
   const room = rooms.get(conn.roomCode);
   if (room && AVAILABLE_GAMES[room.gameType]) {
     AVAILABLE_GAMES[room.gameType].handleGameAction(conn.roomCode, conn.playerId, msg);
+    updateRoomActivity(conn.roomCode);
   }
 }
 
@@ -591,10 +653,10 @@ function handleDisconnect(socketId) {
 
         if (oldHostSlot !== -1) {
           const partnerSlot = (oldHostSlot + 2) % 4;
-          newHostId = Object.keys(room.players).find(pid => room.players[pid].slot === partnerSlot && !room.players[pid].isBot);
+          newHostId = Object.keys(room.players).find(pid => room.players[pid].slot === partnerSlot && !room.players[pid].isBot && playerConnections.has(pid));
         }
         if (!newHostId) {
-          newHostId = Object.keys(room.players).find(pid => pid !== playerId && !room.players[pid].isBot);
+          newHostId = Object.keys(room.players).find(pid => pid !== playerId && !room.players[pid].isBot && playerConnections.has(pid));
         }
 
         if (newHostId) {
@@ -604,16 +666,19 @@ function handleDisconnect(socketId) {
           gameEvent(roomCode, 'HOST_CHANGED', { newHostId: newHostId, newHostName: room.hostName });
           gameEvent(roomCode, 'CHAT', { sender: 'SERVER', message: `${room.hostName} is now the Host.` });
         } else {
-          setTimeout(() => {
-            if (!playerConnections.has(playerId) && rooms.has(roomCode)) {
-              const rCheck = rooms.get(roomCode);
-              const hasHumans = Object.keys(rCheck.players).some(pid => !rCheck.players[pid].isBot);
-              if (!hasHumans) {
-                broadcastToRoom(roomCode, { type: 'ROOM_DELETED', reason: 'Host disconnected and no active players left' });
-                rooms.delete(roomCode);
+          // যদি রুমে আর কোনো অ্যাক্টিভ হিউম্যান না থাকে এবং রুমটি WAITING অবস্থায় থাকে তবে ১৫ সেকেন্ড পর ডিলিট হবে,
+          // আর PLAYING অবস্থায় থাকলে ৫ মিনিটের টাইমার (updateRoomActivity) অনুযায়ী ৫ মিনিট পর ডিলিট হবে।
+          if (room.status === 'WAITING') {
+            setTimeout(() => {
+              if (!playerConnections.has(playerId) && rooms.has(roomCode)) {
+                const rCheck = rooms.get(roomCode);
+                if (!hasActiveHumanPlayer(rCheck)) {
+                  broadcastToRoom(roomCode, { type: 'ROOM_DELETED', reason: 'Host disconnected and no active players left' });
+                  rooms.delete(roomCode);
+                }
               }
-            }
-          }, 15000); 
+            }, 15000);
+          }
         }
       } 
       
@@ -634,6 +699,7 @@ function handleDisconnect(socketId) {
 
                 delete r2.players[playerId];
                 r2.players[`BOT_${s}`] = { name: 'Bot', slot: s, isBot: true };
+                updateRoomActivity(roomCode);
                 broadcastRoomUpdate(roomCode);
                 gameEvent(roomCode, 'CHAT', { sender: 'SERVER', message: `${pName} disconnected. Bot took over Slot ${s + 1}.` });
 
@@ -648,11 +714,14 @@ function handleDisconnect(socketId) {
             setTimeout(() => {
                 if (!playerConnections.has(playerId) && rooms.has(roomCode)) {
                     delete room.players[playerId];
+                    updateRoomActivity(roomCode);
                     broadcastRoomUpdate(roomCode);
                 }
             }, 10000);
         }
       }
+
+      updateRoomActivity(roomCode);
     }
   }
   connections.delete(socketId);
