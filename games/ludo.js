@@ -10,6 +10,7 @@ const rm = require('../roomManager');
 const COLORS = ['Red', 'Blue', 'White', 'Green']; 
 const SAFE_ZONES = [1, 9, 14, 22, 27, 35, 40, 48]; 
 const START_POSITIONS = { 0: 1, 1: 14, 2: 27, 3: 40 };
+const FINISH_POS = 56; // 51..55 হলো Safe 53..57 এবং 56 হলো 58 (Finish)
 
 // ফাস্ট এবং স্মুথ সার্ভার টাইমিং (মিলিসেকেন্ডে)
 const DELAYS = {
@@ -93,8 +94,6 @@ function handleTurnTimeout(roomCode) {
   if (!room || !room.game) return;
   const gs = room.game;
   
-  // ৪০ সেকেন্ড শেষ হলে যদি বট হয় তবে বট চাল দিয়ে দেবে, কিন্তু মানুষ হলে অটোমেটিক টার্ন পরিবর্তন হবে না।
-  // হোস্ট চাইলে চাল স্কিপ করতে পারবে বা প্লেয়ারকে ডিসকানেক্ট করতে পারবে।
   if (isBot(room, gs.turnIndex)) {
     checkBotTurn(roomCode);
     return;
@@ -272,7 +271,7 @@ function handleGameAction(roomCode, playerId, msg) {
       if (room.hostId !== playerId) return;
       const targetSlot = Number(msg.targetSlot);
       if (isNaN(targetSlot) || targetSlot < 0 || targetSlot > 3) return;
-      if (targetSlot === senderIdx) return; // হোস্ট নিজেকে কিক করতে পারবে না
+      if (targetSlot === senderIdx) return;
 
       const targetPid = Object.keys(room.players).find(
           pid => room.players[pid].slot === targetSlot && !room.players[pid].isBot
@@ -322,7 +321,6 @@ function handleGameAction(roomCode, playerId, msg) {
     case 'ROLL_DICE': rollDice(roomCode, senderIdx); break;
     case 'MOVE_TOKEN': moveToken(roomCode, senderIdx, msg.tokenId, msg.diceValue, msg.ownerIdx); break;
     case 'AUDIO_DONE': 
-      // সার্ভার এখন আর ক্লায়েন্টের অডিও শেষ হওয়ার জন্য গেম ব্লক করে রাখবে না
       break;
     case 'ACTION_AWAY':
       gs.playerPresence[senderIdx] = 'away';
@@ -368,9 +366,9 @@ function getValidMovesDetails(gs, playerIdx) {
         if (t.pos === -1 && diceVal === 6) {
           newPos = 0;
           isUnlock = true;
-        } else if (t.pos !== -1 && (t.pos + diceVal) <= 57) {
+        } else if (t.pos !== -1 && (t.pos + diceVal) <= FINISH_POS) {
           newPos = t.pos + diceVal;
-          if (newPos === 57) isFinish = true;
+          if (newPos === FINISH_POS) isFinish = true;
         }
 
         if (newPos !== -1) {
@@ -382,12 +380,12 @@ function getValidMovesDetails(gs, playerIdx) {
                const killDetails = checkAndCutTokenSimulation(gs, ownerIdx, globalPos); 
                if (killDetails) killVictimIdx = killDetails.victimIdx;
              }
-           } else if (newPos > 50 && newPos <= 57) {
+           } else if (newPos > 50 && newPos <= FINISH_POS) {
              isSafeZone = true;
            }
            
            if (!isFinish && t.pos !== -1) {
-               for(let i = 1; i <= 57; i++) {
+               for(let i = 1; i <= FINISH_POS; i++) {
                    if (t.pos + i <= 50) {
                        let gPos = getGlobalPosition(ownerIdx, t.pos + i);
                        if (!SAFE_ZONES.includes(gPos)) { 
@@ -435,6 +433,41 @@ function checkAndCutTokenSimulation(gs, attackerIdx, globalPos) {
     }
   }
   return null;
+}
+
+function buildFinalRankings(room, gs) {
+  const rankings = [];
+  if (gs.playMode === 'team') {
+    const team0Won = checkWinCondition(gs, 0) && checkWinCondition(gs, 2);
+    const winningSlots = team0Won ? [0, 2] : [1, 3];
+    const losingSlots = team0Won ? [1, 3] : [0, 2];
+
+    rankings.push({
+      rank: 1,
+      slots: winningSlots,
+      name: `${getPlayerNameBySlot(room, winningSlots[0])} & ${getPlayerNameBySlot(room, winningSlots[1])}`
+    });
+    rankings.push({
+      rank: 2,
+      slots: losingSlots,
+      name: `${getPlayerNameBySlot(room, losingSlots[0])} & ${getPlayerNameBySlot(room, losingSlots[1])}`
+    });
+  } else {
+    const orderedSlots = [...gs.winners];
+    for (let i = 0; i < 4; i++) {
+      if (!gs.skippedPlayers[i] && !orderedSlots.includes(i)) {
+        orderedSlots.push(i);
+      }
+    }
+    orderedSlots.forEach((slot, idx) => {
+      rankings.push({
+        rank: idx + 1,
+        slot: slot,
+        name: getPlayerNameBySlot(room, slot)
+      });
+    });
+  }
+  return rankings;
 }
 
 function rollDice(roomCode, playerIdx) {
@@ -610,9 +643,15 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
     if (!gs.winners.includes(ownerIdx)) gs.winners.push(ownerIdx);
     
     if (gs.winners.length >= gs.activePlayerCount - 1 || (gs.playMode === 'team' && checkTeamWin(gs))) {
+       const finalRankings = buildFinalRankings(room, gs);
        rm.gameEvent(roomCode, 'TOKEN_FINISHED', { playerIdx, ownerIdx, tokenId, newPos: move.newPos, diceValue, cutDetails });
        scheduleNextStep(roomCode, () => {
-         rm.gameEvent(roomCode, 'GAME_OVER', { winners: gs.winners });
+         clearAllTimers(roomCode, gs);
+         rm.gameEvent(roomCode, 'GAME_OVER', {
+           winners: gs.winners,
+           rankings: finalRankings,
+           playMode: gs.playMode
+         });
          if (rm.resolveUniversalGame) {
            rm.resolveUniversalGame(roomCode, gs.winners);
          }
@@ -721,7 +760,7 @@ function checkBotTurn(roomCode) {
   }
 }
 
-function checkWinCondition(gs, playerIdx) { return gs.tokens[playerIdx].length > 0 && gs.tokens[playerIdx].every(t => t.pos === 57); }
+function checkWinCondition(gs, playerIdx) { return gs.tokens[playerIdx].length > 0 && gs.tokens[playerIdx].every(t => t.pos === FINISH_POS); }
 function checkTeamWin(gs) { return (checkWinCondition(gs, 0) && checkWinCondition(gs, 2)) || (checkWinCondition(gs, 1) && checkWinCondition(gs, 3)); }
 function isBot(room, playerIdx) {
   const pId = Object.keys(room.players).find(id => room.players[id].slot === playerIdx);
@@ -785,8 +824,6 @@ function handlePlayerDisconnectDuringGame(roomCode, slot) {
         gs.playerPresence[slot] = 'bot';
         checkBotTurn(roomCode);
     } else {
-        // ৪০ সেকেন্ডের লজিক অনুযায়ী প্লেয়ারের নাম ও স্ট্যাটাস অফলাইন দেখানো হবে,
-        // যাতে হোস্ট নিজে সিদ্ধান্ত নিতে পারে তাকে কিক করবে নাকি চাল পাস করবে।
         gs.playerPresence[slot] = 'disconnected';
         rm.gameEvent(roomCode, 'PLAYER_PRESENCE_UPDATED', {
             slot: slot,
