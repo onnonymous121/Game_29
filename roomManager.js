@@ -74,6 +74,30 @@ function broadcastToRoom(roomCode, payload, excludePlayerId = null) {
   });
 }
 
+// ── প্লেয়ারদের বর্তমান অনলাইন/অফলাইন/অ্যাওয়ে স্ট্যাটাস বের করার হেল্পার ──
+function buildPlayerPresence(room) {
+  const presence = {};
+  if (!room || !room.players) return presence;
+
+  Object.entries(room.players).forEach(([pid, pData]) => {
+    const slot = pData.slot;
+    if (pData.isBot) {
+      presence[slot] = 'bot';
+      return;
+    }
+    const sid = playerConnections.get(pid);
+    const conn = sid ? connections.get(sid) : null;
+    if (!conn || !conn.ws || conn.ws.readyState !== WebSocket.OPEN) {
+      presence[slot] = 'disconnected';
+    } else if (conn.isAway) {
+      presence[slot] = 'away';
+    } else {
+      presence[slot] = 'online';
+    }
+  });
+  return presence;
+}
+
 function broadcastRoomUpdate(roomCode) {
   const room = rooms.get(roomCode);
   if (!room) return;
@@ -86,6 +110,7 @@ function broadcastRoomUpdate(roomCode) {
       gameType: room.gameType, playMode: room.playMode, 
       allowAudience: room.allowAudience, sessionId: room.sessionId,
       players: room.players, requests: room.requests, audiences: room.audiences,
+      playerPresence: buildPlayerPresence(room),
       prizePool: room.prizePool || 0 
     },
   });
@@ -97,7 +122,45 @@ function gameEvent(roomCode, event, payload, targetPlayerId = null) {
   else broadcastToRoom(roomCode, msg);
 }
 
-// ── NEW: Check if at least one real human player is online and active in the room ──
+// ── ডিসকানেক্ট হওয়া প্লেয়ার ফিরে এলে বট সরিয়ে তার সিট ফিরিয়ে দেওয়ার হেল্পার (Auto-Revive) ──
+function tryReviveDisconnectedPlayer(roomCode, room, playerId) {
+  if (!room || !room.disconnectedPlayers || !room.disconnectedPlayers[playerId]) return false;
+  const oldData = room.disconnectedPlayers[playerId];
+  const slot = oldData.slot;
+  const playerName = oldData.name;
+
+  // যদি ওই স্লটে এখনো বট থাকে বা স্লটটি খালি থাকে
+  const currentOccupantEntry = Object.entries(room.players).find(([, p]) => p.slot === slot);
+  if (!currentOccupantEntry || currentOccupantEntry[1].isBot) {
+    if (currentOccupantEntry) {
+      delete room.players[currentOccupantEntry[0]];
+    }
+    room.players[playerId] = { name: playerName, slot: slot, isBot: false };
+    delete room.disconnectedPlayers[playerId];
+    room.emptySince = null;
+
+    broadcastRoomUpdate(roomCode);
+    gameEvent(roomCode, 'CHAT', {
+      sender: 'SERVER',
+      senderName: 'SERVER',
+      message: `${playerName} rejoined the game and took back their seat.`
+    });
+    gameEvent(roomCode, 'PLAYER_REJOINED', { playerId, slot, playerName });
+
+    const gameModule = AVAILABLE_GAMES[room.gameType];
+    if (gameModule) {
+      if (typeof gameModule.handlePlayerRejoinDuringGame === 'function') {
+        gameModule.handlePlayerRejoinDuringGame(roomCode, playerId, slot, playerName);
+      } else if (typeof gameModule.syncPromotedAudience === 'function') {
+        gameModule.syncPromotedAudience(roomCode, playerId, slot);
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+// ── Check if at least one real human player is online and active in the room ──
 function hasActiveHumanPlayer(room) {
   if (!room || !room.players) return false;
   return Object.keys(room.players).some((pid) => {
@@ -110,7 +173,7 @@ function hasActiveHumanPlayer(room) {
   });
 }
 
-// ── NEW: Update room activity status & track when it becomes empty of active humans ──
+// ── Update room activity status & track when it becomes empty of active humans ──
 function updateRoomActivity(roomCode) {
   const room = rooms.get(roomCode);
   if (!room) return;
@@ -123,8 +186,10 @@ function updateRoomActivity(roomCode) {
   }
 }
 
-// ── NEW: Background interval that deletes any room with no active human for > 5 minutes ──
+// ── Background interval that deletes any room with no active human for > 5 minutes ──
 const INACTIVE_ROOM_TIMEOUT_MS = 5 * 60 * 1000; // 5 Minutes
+const AUDIENCE_CHAT_COOLDOWN_MS = 5 * 60 * 1000; // অডিয়েন্সের জন্য ৫ মিনিটে ১টি মেসেজ
+
 setInterval(() => {
   const now = Date.now();
   rooms.forEach((room, roomCode) => {
@@ -270,6 +335,7 @@ router.get('/rooms/:code', (req, res) => {
     gameType: room.gameType, playMode: room.playMode, sessionId: room.sessionId, 
     playerCount: Object.keys(room.players).length,
     players: room.players, requests: room.requests, audiences: room.audiences,
+    playerPresence: buildPlayerPresence(room),
   });
 });
 
@@ -283,6 +349,7 @@ router.post('/rooms/create', (req, res) => {
   const finalGameType = gameType || '29'; 
   const finalPlayMode = playMode || (finalGameType === '29' ? 'team' : 'individual'); 
 
+  // ডিফল্টভাবে হোস্ট সবসময় স্লট ১ (index 0)-এ থাকবে
   rooms.set(roomCode, {
     hostId: playerId, hostName: playerName,
     status: 'WAITING',
@@ -294,8 +361,10 @@ router.post('/rooms/create', (req, res) => {
     emptySince: null,
     players: { [playerId]: { name: playerName, slot: 0, isBot: false } },
     requests: {}, audiences: {},
+    audienceChatTimestamps: {},
     game: null,
     disconnectedPlayers: {},
+    disconnectTimers: {},
     prizePool: 0, 
   });
   res.json({ success: true, roomCode, gameType: finalGameType, playMode: finalPlayMode });
@@ -308,18 +377,23 @@ router.post('/rooms/:code/join', (req, res) => {
   const room = rooms.get(req.params.code);
   if (!room) return res.status(404).json({ error: 'Room not found' });
 
-  if (room.disconnectedPlayers && room.disconnectedPlayers[playerId]) {
-    const oldData = room.disconnectedPlayers[playerId];
-    if (room.players[`BOT_${oldData.slot}`]) {
-      delete room.players[`BOT_${oldData.slot}`];
-      room.players[playerId] = { name: playerName, slot: oldData.slot, isBot: false };
-      delete room.disconnectedPlayers[playerId];
-      room.emptySince = null;
-      broadcastRoomUpdate(req.params.code);
-      gameEvent(req.params.code, 'CHAT', { sender: 'SERVER', message: `${playerName} rejoined the game and took back their seat.` });
-      gameEvent(req.params.code, 'PLAYER_REJOINED', { playerId, slot: oldData.slot, playerName });
-      return res.json({ role: 'player', reason: 'rejoined', gameType: room.gameType, playMode: room.playMode });
-    }
+  // যদি এই প্লেয়ারের কোনো ডিসকানেক্ট টাইমার চলে থাকে, তা বাতিল করা হলো
+  if (room.disconnectTimers && room.disconnectTimers[playerId]) {
+    clearTimeout(room.disconnectTimers[playerId]);
+    delete room.disconnectTimers[playerId];
+  }
+
+  // যদি প্লেয়ার ইতিমধ্যে রুমের প্লেয়ার লিস্টে থাকে (যেমন অ্যাপ মিনিমাইজ করে আবার জয়েন কল করলে)
+  if (room.players[playerId] && !asAudience) {
+    room.players[playerId].name = playerName;
+    room.emptySince = null;
+    broadcastRoomUpdate(req.params.code);
+    return res.json({ role: 'player', reason: 'already_in_room', gameType: room.gameType, playMode: room.playMode });
+  }
+
+  // ডিসকানেক্ট হওয়া প্লেয়ার ফিরে এলে সিট ফিরিয়ে দেওয়া
+  if (tryReviveDisconnectedPlayer(req.params.code, room, playerId)) {
+    return res.json({ role: 'player', reason: 'rejoined', gameType: room.gameType, playMode: room.playMode });
   }
 
   if (asAudience) {
@@ -348,23 +422,49 @@ router.post('/rooms/:code/join', (req, res) => {
   res.json({ role: 'requested', gameType: room.gameType, playMode: room.playMode });
 });
 
+// ── নির্দিষ্ট স্লটে (যেমন ২ নম্বর খালি রেখে ৩ নম্বর স্লটে) প্লেয়ার অ্যাসাইন করার আপডেট ──
 router.post('/rooms/:code/admit', (req, res) => {
-  const { hostId, playerId } = req.body;
+  const { hostId, playerId, slot: requestedSlot } = req.body;
   const room = rooms.get(req.params.code);
   if (!room) return res.status(404).json({ error: 'Room not found' });
   if (room.hostId !== hostId) return res.status(403).json({ error: 'Not the host' });
 
-  const req2 = room.requests[playerId];
+  const req2 = room.requests[playerId] || room.audiences[playerId];
   if (!req2) return res.status(404).json({ error: 'Request not found' });
 
-  const slot = findFirstEmptySlot(room.players);
-  if (slot === -1) return res.status(400).json({ error: 'Room full' });
+  let assignedSlot = -1;
+  if (requestedSlot !== undefined && requestedSlot !== null) {
+    const parsedSlot = Number(requestedSlot);
+    if (parsedSlot >= 0 && parsedSlot < 4) {
+      // যদি ওই স্লটে কোনো বট থাকে তবে বট সরিয়ে প্লেয়ার বসবে, আর রিয়েল প্লেয়ার থাকলে এরর দেবে
+      const existingEntry = Object.entries(room.players).find(([, p]) => p.slot === parsedSlot);
+      if (!existingEntry) {
+        assignedSlot = parsedSlot;
+      } else if (existingEntry[1].isBot) {
+        delete room.players[existingEntry[0]];
+        assignedSlot = parsedSlot;
+      }
+    }
+  }
+
+  if (assignedSlot === -1) {
+    assignedSlot = findFirstEmptySlot(room.players);
+  }
+  if (assignedSlot === -1) return res.status(400).json({ error: 'Room full or slot occupied' });
 
   delete room.requests[playerId];
-  room.players[playerId] = { name: req2.name, slot, isBot: false };
+  delete room.audiences[playerId];
+  room.players[playerId] = { name: req2.name, slot: assignedSlot, isBot: false };
+
+  const sid = playerConnections.get(playerId);
+  if (sid) {
+    const conn = connections.get(sid);
+    if (conn) conn.isAudience = false;
+  }
+
   updateRoomActivity(req.params.code);
   broadcastRoomUpdate(req.params.code);
-  res.json({ success: true });
+  res.json({ success: true, slot: assignedSlot });
 });
 
 router.post('/rooms/:code/reject', (req, res) => {
@@ -378,6 +478,67 @@ router.post('/rooms/:code/reject', (req, res) => {
   if (sid) sendToSocket(sid, { type: 'REJECTED' });
   broadcastRoomUpdate(req.params.code);
   res.json({ success: true });
+});
+
+// ── হোস্ট কর্তৃক অ্যাসাইন করা প্লেয়ারকে স্লট থেকে সরানো (Unassign করে অপেক্ষমান তালিকায় পাঠানো বা রুম থেকে কিক করা) ──
+router.post('/rooms/:code/remove_player', (req, res) => {
+  const { hostId, targetPlayerId, moveToRequests } = req.body;
+  const room = rooms.get(req.params.code);
+  if (!room) return res.status(404).json({ error: 'Room not found' });
+  if (room.hostId !== hostId) return res.status(403).json({ error: 'Not the host' });
+  if (targetPlayerId === hostId) return res.status(400).json({ error: 'Host cannot remove themselves' });
+
+  const pData = room.players[targetPlayerId];
+  if (!pData) return res.status(404).json({ error: 'Player not found in slot' });
+
+  delete room.players[targetPlayerId];
+
+  if (moveToRequests && !pData.isBot) {
+    room.requests[targetPlayerId] = { name: pData.name };
+    sendToPlayer(targetPlayerId, { type: 'UNASSIGNED_TO_REQUESTS' });
+  } else if (!pData.isBot) {
+    sendToPlayer(targetPlayerId, { type: 'KICKED_BY_HOST' });
+  }
+
+  updateRoomActivity(req.params.code);
+  broadcastRoomUpdate(req.params.code);
+  res.json({ success: true });
+});
+
+// ── হোস্ট কর্তৃক নির্দিষ্ট অডিয়েন্সকে রিমুভ করা ──
+router.post('/rooms/:code/kick_audience', (req, res) => {
+  const { hostId, audienceId } = req.body;
+  const room = rooms.get(req.params.code);
+  if (!room) return res.status(404).json({ error: 'Room not found' });
+  if (room.hostId !== hostId) return res.status(403).json({ error: 'Not the host' });
+
+  if (room.audiences[audienceId]) {
+    delete room.audiences[audienceId];
+    sendToPlayer(audienceId, { type: 'KICKED_BY_HOST', reason: 'Removed from audience by host' });
+    broadcastRoomUpdate(req.params.code);
+  }
+  res.json({ success: true });
+});
+
+// ── হোস্ট কর্তৃক যেকোনো সময় অডিয়েন্স দেখা চালু বা বন্ধ করা ──
+router.post('/rooms/:code/toggle_audience', (req, res) => {
+  const { hostId, allowAudience } = req.body;
+  const room = rooms.get(req.params.code);
+  if (!room) return res.status(404).json({ error: 'Room not found' });
+  if (room.hostId !== hostId) return res.status(403).json({ error: 'Not the host' });
+
+  room.allowAudience = Boolean(allowAudience);
+
+  // যদি অডিয়েন্স বন্ধ করে দেওয়া হয়, তবে বর্তমান সকল অডিয়েন্সকে রুম থেকে বের করে দেওয়া হবে
+  if (!room.allowAudience && room.audiences) {
+    Object.keys(room.audiences).forEach((aid) => {
+      sendToPlayer(aid, { type: 'AUDIENCE_DISABLED', reason: 'Host disabled audience viewing' });
+    });
+    room.audiences = {};
+  }
+
+  broadcastRoomUpdate(req.params.code);
+  res.json({ success: true, allowAudience: room.allowAudience });
 });
 
 // ── START GAME: ENTRY FEE DEDUCTION LOGIC ──
@@ -436,13 +597,19 @@ router.delete('/rooms/:code', (req, res) => {
   const room = rooms.get(req.params.code);
   if (!room) return res.status(404).json({ error: 'Room not found' });
 
-  if (isHost) {
+  if (room.disconnectTimers && room.disconnectTimers[playerId]) {
+    clearTimeout(room.disconnectTimers[playerId]);
+    delete room.disconnectTimers[playerId];
+  }
+
+  if (isHost && room.hostId === playerId) {
     broadcastToRoom(req.params.code, { type: 'ROOM_DELETED', reason: 'Host deleted room' });
     rooms.delete(req.params.code);
   } else {
     delete room.players[playerId];
     delete room.audiences[playerId];
     delete room.requests[playerId];
+    if (room.disconnectedPlayers) delete room.disconnectedPlayers[playerId];
     updateRoomActivity(req.params.code);
     broadcastRoomUpdate(req.params.code);
   }
@@ -517,7 +684,7 @@ router.post('/rooms/:code/promote', (req, res) => {
 
   updateRoomActivity(req.params.code);
   broadcastRoomUpdate(req.params.code);
-  gameEvent(req.params.code, 'CHAT', { sender: 'SERVER', message: `${audienceName} replaced Bot in Slot ${targetSlot + 1}` });
+  gameEvent(req.params.code, 'CHAT', { sender: 'SERVER', senderName: 'SERVER', message: `${audienceName} replaced Bot in Slot ${targetSlot + 1}` });
 
   const gameModule = AVAILABLE_GAMES[room.gameType];
   if (gameModule && gameModule.syncPromotedAudience) {
@@ -548,7 +715,7 @@ router.post('/rooms/:code/replace_bot', (req, res) => {
 // ============================================================
 function handleConnection(ws) {
   const socketId = crypto.randomUUID();
-  connections.set(socketId, { ws, playerId: null, roomCode: null, isAudience: false, isAway: false });
+  connections.set(socketId, { ws, playerId: null, roomCode: null, isAudience: false, isAway: false, lastPing: Date.now() });
   ws.send(JSON.stringify({ type: 'CONNECTED', socketId }));
 
   ws.on('message', (raw) => {
@@ -565,6 +732,7 @@ function handleConnection(ws) {
 function handleWsMessage(socketId, msg) {
   const conn = connections.get(socketId);
   if (!conn) return;
+  conn.lastPing = Date.now();
 
   switch (msg.type) {
     case 'REGISTER': {
@@ -582,8 +750,20 @@ function handleWsMessage(socketId, msg) {
       conn.isAudience = isAudience || false;
       conn.isAway = false;
       playerConnections.set(playerId, socketId);
+
+      const room = rooms.get(roomCode);
+      if (room) {
+        // প্লেয়ার ফিরে এলে তার ডিসকানেক্ট টাইমার বাতিল করা হবে
+        if (room.disconnectTimers && room.disconnectTimers[playerId]) {
+          clearTimeout(room.disconnectTimers[playerId]);
+          delete room.disconnectTimers[playerId];
+        }
+        // যদি গেম চলাকালীন ডিসকানেক্ট হয়ে বট বসে গিয়ে থাকে, তবে অটো-রিভাইভ করে তার সিট ফিরিয়ে দেওয়া হবে
+        tryReviveDisconnectedPlayer(roomCode, room, playerId);
+      }
       
       updateRoomActivity(roomCode);
+      broadcastRoomUpdate(roomCode);
 
       if (conn.ws && conn.ws.readyState === WebSocket.OPEN) {
         conn.ws.send(JSON.stringify({ type: 'REGISTERED', playerId, roomCode }));
@@ -591,6 +771,7 @@ function handleWsMessage(socketId, msg) {
       return; 
     }
     case 'PING':
+      conn.lastPing = Date.now();
       if (conn.ws && conn.ws.readyState === WebSocket.OPEN) {
         conn.ws.send(JSON.stringify({ type: 'PONG', timestamp: Date.now() }));
       }
@@ -600,8 +781,11 @@ function handleWsMessage(socketId, msg) {
       const room = rooms.get(conn.roomCode);
       if (room) {
         const senderIdx = getSlotIndex(room, conn.playerId);
-        if (senderIdx !== -1) gameEvent(conn.roomCode, 'PLAYER_AWAY_STATE', { slot: senderIdx, isAway: true, playerName: room.players[conn.playerId]?.name });
+        if (senderIdx !== -1) {
+          gameEvent(conn.roomCode, 'PLAYER_AWAY_STATE', { slot: senderIdx, isAway: true, playerName: room.players[conn.playerId]?.name });
+        }
         updateRoomActivity(conn.roomCode);
+        broadcastRoomUpdate(conn.roomCode);
       }
       return;
     }
@@ -609,16 +793,103 @@ function handleWsMessage(socketId, msg) {
       conn.isAway = false;
       const room = rooms.get(conn.roomCode);
       if (room) {
+        if (room.disconnectTimers && room.disconnectTimers[conn.playerId]) {
+          clearTimeout(room.disconnectTimers[conn.playerId]);
+          delete room.disconnectTimers[conn.playerId];
+        }
+        tryReviveDisconnectedPlayer(conn.roomCode, room, conn.playerId);
         const senderIdx = getSlotIndex(room, conn.playerId);
-        if (senderIdx !== -1) gameEvent(conn.roomCode, 'PLAYER_AWAY_STATE', { slot: senderIdx, isAway: false, playerName: room.players[conn.playerId]?.name });
+        if (senderIdx !== -1) {
+          gameEvent(conn.roomCode, 'PLAYER_AWAY_STATE', { slot: senderIdx, isAway: false, playerName: room.players[conn.playerId]?.name });
+        }
         updateRoomActivity(conn.roomCode);
+        broadcastRoomUpdate(conn.roomCode);
       }
       return;
     }
     case 'ACTION_CHAT': {
       if (conn.roomCode && msg.message) {
-        gameEvent(conn.roomCode, 'CHAT', { sender: conn.playerId, message: msg.message });
+        const room = rooms.get(conn.roomCode);
+        if (!room) return;
+
+        const isAudienceMember = Boolean(room.audiences && room.audiences[conn.playerId]) || conn.isAudience;
+        const senderName =
+          room.players[conn.playerId]?.name ||
+          room.audiences[conn.playerId]?.name ||
+          room.requests[conn.playerId]?.name ||
+          msg.senderName ||
+          'Player';
+
+        // অডিয়েন্স হলে প্রতি ৫ মিনিটে ১টি মেসেজ পাঠানোর সীমা চেক করা হবে
+        if (isAudienceMember) {
+          room.audienceChatTimestamps = room.audienceChatTimestamps || {};
+          const lastSent = room.audienceChatTimestamps[conn.playerId] || 0;
+          const now = Date.now();
+          if (now - lastSent < AUDIENCE_CHAT_COOLDOWN_MS) {
+            const remainingSec = Math.ceil((AUDIENCE_CHAT_COOLDOWN_MS - (now - lastSent)) / 1000);
+            sendToSocket(socketId, {
+              type: 'CHAT_COOLDOWN',
+              remainingSeconds: remainingSec,
+              message: `Audience can send 1 message every 5 minutes. Please wait ${remainingSec}s.`
+            });
+            return;
+          }
+          room.audienceChatTimestamps[conn.playerId] = now;
+        }
+
+        gameEvent(conn.roomCode, 'CHAT', {
+          sender: senderName,
+          senderId: conn.playerId,
+          senderName: senderName,
+          isAudience: isAudienceMember,
+          message: msg.message
+        });
       }
+      return;
+    }
+    // ── ওয়েবসকেটের মাধ্যমেও হোস্ট কর্তৃক প্লেয়ার রিমুভ/আন-অ্যাসাইন ও অডিয়েন্স কন্ট্রোল ──
+    case 'REMOVE_PLAYER':
+    case 'UNASSIGN_PLAYER': {
+      const room = rooms.get(conn.roomCode);
+      if (!room || room.hostId !== conn.playerId) return;
+      const targetId = msg.targetPlayerId;
+      if (!targetId || targetId === room.hostId || !room.players[targetId]) return;
+
+      const pData = room.players[targetId];
+      delete room.players[targetId];
+
+      if (msg.type === 'UNASSIGN_PLAYER' && !pData.isBot) {
+        room.requests[targetId] = { name: pData.name };
+        sendToPlayer(targetId, { type: 'UNASSIGNED_TO_REQUESTS' });
+      } else if (!pData.isBot) {
+        sendToPlayer(targetId, { type: 'KICKED_BY_HOST' });
+      }
+      updateRoomActivity(conn.roomCode);
+      broadcastRoomUpdate(conn.roomCode);
+      return;
+    }
+    case 'KICK_AUDIENCE': {
+      const room = rooms.get(conn.roomCode);
+      if (!room || room.hostId !== conn.playerId) return;
+      const aid = msg.audienceId;
+      if (aid && room.audiences[aid]) {
+        delete room.audiences[aid];
+        sendToPlayer(aid, { type: 'KICKED_BY_HOST', reason: 'Removed from audience by host' });
+        broadcastRoomUpdate(conn.roomCode);
+      }
+      return;
+    }
+    case 'TOGGLE_AUDIENCE_ALLOW': {
+      const room = rooms.get(conn.roomCode);
+      if (!room || room.hostId !== conn.playerId) return;
+      room.allowAudience = Boolean(msg.allowAudience);
+      if (!room.allowAudience && room.audiences) {
+        Object.keys(room.audiences).forEach((aid) => {
+          sendToPlayer(aid, { type: 'AUDIENCE_DISABLED', reason: 'Host disabled audience viewing' });
+        });
+        room.audiences = {};
+      }
+      broadcastRoomUpdate(conn.roomCode);
       return;
     }
   }
@@ -643,51 +914,92 @@ function handleDisconnect(socketId) {
   if (playerId && roomCode) {
     const room = rooms.get(roomCode);
     if (room) {
+      room.disconnectTimers = room.disconnectTimers || {};
+
       if (isAudience) {
-        delete room.audiences[playerId];
-        broadcastRoomUpdate(roomCode);
-      } else if (room.hostId === playerId) {
-        
-        const oldHostSlot = getSlotIndex(room, playerId);
-        let newHostId = null;
-
-        if (oldHostSlot !== -1) {
-          const partnerSlot = (oldHostSlot + 2) % 4;
-          newHostId = Object.keys(room.players).find(pid => room.players[pid].slot === partnerSlot && !room.players[pid].isBot && playerConnections.has(pid));
-        }
-        if (!newHostId) {
-          newHostId = Object.keys(room.players).find(pid => pid !== playerId && !room.players[pid].isBot && playerConnections.has(pid));
-        }
-
-        if (newHostId) {
-          room.hostId = newHostId;
-          room.hostName = room.players[newHostId].name;
+        // অডিয়েন্স অন্য অ্যাপে গেলে বা নেট ফ্ল্যাকচুয়েট করলে অন্তত ৬০ সেকেন্ড সময় পাবে ফিরে আসার
+        room.disconnectTimers[playerId] = setTimeout(() => {
+          if (!playerConnections.has(playerId) && rooms.has(roomCode)) {
+            const rCheck = rooms.get(roomCode);
+            if (rCheck && rCheck.audiences[playerId]) {
+              delete rCheck.audiences[playerId];
+              broadcastRoomUpdate(roomCode);
+            }
+          }
+        }, 60 * 1000);
+      } else {
+        // ── রিয়েল প্লেয়ার বা হোস্ট ডিসকানেক্ট হলে:
+        // লবিতে (WAITING) থাকলে সাথে সাথে হোস্ট পরিবর্তন বা ১০ সেকেন্ডে কিক করা হবে না!
+        // ৫ মিনিট (INACTIVE_ROOM_TIMEOUT_MS) সময় দেওয়া হবে যাতে লিংক শেয়ার করে বা অন্য অ্যাপ থেকে ফিরে আসতে পারে।
+        if (room.status === 'WAITING') {
           broadcastRoomUpdate(roomCode);
-          gameEvent(roomCode, 'HOST_CHANGED', { newHostId: newHostId, newHostName: room.hostName });
-          gameEvent(roomCode, 'CHAT', { sender: 'SERVER', message: `${room.hostName} is now the Host.` });
-        } else {
-          // যদি রুমে আর কোনো অ্যাক্টিভ হিউম্যান না থাকে এবং রুমটি WAITING অবস্থায় থাকে তবে ১৫ সেকেন্ড পর ডিলিট হবে,
-          // আর PLAYING অবস্থায় থাকলে ৫ মিনিটের টাইমার (updateRoomActivity) অনুযায়ী ৫ মিনিট পর ডিলিট হবে।
-          if (room.status === 'WAITING') {
-            setTimeout(() => {
-              if (!playerConnections.has(playerId) && rooms.has(roomCode)) {
-                const rCheck = rooms.get(roomCode);
-                if (!hasActiveHumanPlayer(rCheck)) {
-                  broadcastToRoom(roomCode, { type: 'ROOM_DELETED', reason: 'Host disconnected and no active players left' });
+
+          room.disconnectTimers[playerId] = setTimeout(() => {
+            if (!playerConnections.has(playerId) && rooms.has(roomCode)) {
+              const rCheck = rooms.get(roomCode);
+              if (!rCheck) return;
+
+              if (rCheck.hostId === playerId) {
+                // ৫ মিনিটেও হোস্ট ফিরে না এলে অন্য কোনো অনলাইন হিউম্যান প্লেয়ার থাকলে তাকে হোস্ট বানানো হবে
+                const nextHostId = Object.keys(rCheck.players).find(
+                  pid => pid !== playerId && !rCheck.players[pid].isBot && playerConnections.has(pid)
+                );
+                if (nextHostId) {
+                  delete rCheck.players[playerId];
+                  rCheck.hostId = nextHostId;
+                  rCheck.hostName = rCheck.players[nextHostId].name;
+                  broadcastRoomUpdate(roomCode);
+                  gameEvent(roomCode, 'HOST_CHANGED', { newHostId: nextHostId, newHostName: rCheck.hostName });
+                  gameEvent(roomCode, 'CHAT', { sender: 'SERVER', senderName: 'SERVER', message: `${rCheck.hostName} is now the Host.` });
+                } else {
+                  broadcastToRoom(roomCode, { type: 'ROOM_DELETED', reason: 'Host inactive for 5 minutes' });
                   rooms.delete(roomCode);
                 }
+              } else if (rCheck.players[playerId]) {
+                delete rCheck.players[playerId];
+                updateRoomActivity(roomCode);
+                broadcastRoomUpdate(roomCode);
               }
-            }, 15000);
-          }
-        }
-      } 
-      
-      if (!isAudience) {
-        if (room.game && room.status === 'PLAYING') {
+            }
+          }, INACTIVE_ROOM_TIMEOUT_MS);
+        } else if (room.game && room.status === 'PLAYING') {
+          // ── গেম চলাকালীন (PLAYING) ডিসকানেক্ট হলে ──
           const slot = getSlotIndex(room, playerId);
+          broadcastRoomUpdate(roomCode);
           gameEvent(roomCode, 'PLAYER_DISCONNECTED', { playerId, slot });
 
-          setTimeout(() => {
+          // হোস্ট যদি গেম চলাকালীন ডিসকানেক্ট হয়, তবে সাথে সাথে হোস্ট না বদলে অন্তত ২ মিনিট অপেক্ষা করবে
+          if (room.hostId === playerId) {
+            room.disconnectTimers[`host_${playerId}`] = setTimeout(() => {
+              if (!playerConnections.has(playerId) && rooms.has(roomCode)) {
+                const rHost = rooms.get(roomCode);
+                if (rHost && rHost.hostId === playerId) {
+                  const oldHostSlot = getSlotIndex(rHost, playerId);
+                  let newHostId = null;
+                  if (oldHostSlot !== -1) {
+                    const partnerSlot = (oldHostSlot + 2) % 4;
+                    newHostId = Object.keys(rHost.players).find(
+                      pid => rHost.players[pid].slot === partnerSlot && !rHost.players[pid].isBot && playerConnections.has(pid)
+                    );
+                  }
+                  if (!newHostId) {
+                    newHostId = Object.keys(rHost.players).find(
+                      pid => pid !== playerId && !rHost.players[pid].isBot && playerConnections.has(pid)
+                    );
+                  }
+                  if (newHostId) {
+                    rHost.hostId = newHostId;
+                    rHost.hostName = rHost.players[newHostId].name;
+                    broadcastRoomUpdate(roomCode);
+                    gameEvent(roomCode, 'HOST_CHANGED', { newHostId, newHostName: rHost.hostName });
+                    gameEvent(roomCode, 'CHAT', { sender: 'SERVER', senderName: 'SERVER', message: `${rHost.hostName} is now the Host.` });
+                  }
+                }
+              }
+            }, 2 * 60 * 1000);
+          }
+
+          room.disconnectTimers[playerId] = setTimeout(() => {
             if (!playerConnections.has(playerId) && rooms.has(roomCode)) {
               const r2 = rooms.get(roomCode);
               if (r2 && r2.players[playerId]) {
@@ -701,23 +1013,15 @@ function handleDisconnect(socketId) {
                 r2.players[`BOT_${s}`] = { name: 'Bot', slot: s, isBot: true };
                 updateRoomActivity(roomCode);
                 broadcastRoomUpdate(roomCode);
-                gameEvent(roomCode, 'CHAT', { sender: 'SERVER', message: `${pName} disconnected. Bot took over Slot ${s + 1}.` });
+                gameEvent(roomCode, 'CHAT', { sender: 'SERVER', senderName: 'SERVER', message: `${pName} disconnected. Bot took over Slot ${s + 1}.` });
 
                 const gameModule = AVAILABLE_GAMES[room.gameType];
                 if (gameModule && gameModule.handlePlayerDisconnectDuringGame) {
-                    gameModule.handlePlayerDisconnectDuringGame(roomCode, s);
+                  gameModule.handlePlayerDisconnectDuringGame(roomCode, s);
                 }
               }
             }
           }, 15 * 1000);
-        } else if (room.status === 'WAITING' && room.hostId !== playerId) {
-            setTimeout(() => {
-                if (!playerConnections.has(playerId) && rooms.has(roomCode)) {
-                    delete room.players[playerId];
-                    updateRoomActivity(roomCode);
-                    broadcastRoomUpdate(roomCode);
-                }
-            }, 10000);
         }
       }
 
