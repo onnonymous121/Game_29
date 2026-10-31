@@ -74,6 +74,19 @@ function broadcastToRoom(roomCode, payload, excludePlayerId = null) {
   });
 }
 
+// ── প্লেয়ার এবং হোস্ট উভয়ের ডিসকানেক্ট টাইমার ক্লিয়ার করার হেল্পার ──
+function clearPlayerDisconnectTimers(room, playerId) {
+  if (!room || !room.disconnectTimers) return;
+  if (room.disconnectTimers[playerId]) {
+    clearTimeout(room.disconnectTimers[playerId]);
+    delete room.disconnectTimers[playerId];
+  }
+  if (room.disconnectTimers[`host_${playerId}`]) {
+    clearTimeout(room.disconnectTimers[`host_${playerId}`]);
+    delete room.disconnectTimers[`host_${playerId}`];
+  }
+}
+
 // ── প্লেয়ারদের বর্তমান অনলাইন/অফলাইন/অ্যাওয়ে স্ট্যাটাস বের করার হেল্পার ──
 function buildPlayerPresence(room) {
   const presence = {};
@@ -147,12 +160,17 @@ function tryReviveDisconnectedPlayer(roomCode, room, playerId) {
     });
     gameEvent(roomCode, 'PLAYER_REJOINED', { playerId, slot, playerName });
 
-    const gameModule = AVAILABLE_GAMES[room.gameType];
-    if (gameModule) {
-      if (typeof gameModule.handlePlayerRejoinDuringGame === 'function') {
-        gameModule.handlePlayerRejoinDuringGame(roomCode, playerId, slot, playerName);
-      } else if (typeof gameModule.syncPromotedAudience === 'function') {
-        gameModule.syncPromotedAudience(roomCode, playerId, slot);
+    // শুধুমাত্র যদি প্লেয়ারের সকেট ইতিমধ্যে কানেক্টেড থাকে, তবেই সাথে সাথে সিঙ্ক পাঠানো হবে
+    const sid = playerConnections.get(playerId);
+    const conn = sid ? connections.get(sid) : null;
+    if (conn && conn.ws && conn.ws.readyState === WebSocket.OPEN) {
+      const gameModule = AVAILABLE_GAMES[room.gameType];
+      if (gameModule) {
+        if (typeof gameModule.handlePlayerRejoinDuringGame === 'function') {
+          gameModule.handlePlayerRejoinDuringGame(roomCode, playerId, slot, playerName);
+        } else if (typeof gameModule.syncPromotedAudience === 'function') {
+          gameModule.syncPromotedAudience(roomCode, playerId, slot);
+        }
       }
     }
     return true;
@@ -378,10 +396,7 @@ router.post('/rooms/:code/join', (req, res) => {
   if (!room) return res.status(404).json({ error: 'Room not found' });
 
   // যদি এই প্লেয়ারের কোনো ডিসকানেক্ট টাইমার চলে থাকে, তা বাতিল করা হলো
-  if (room.disconnectTimers && room.disconnectTimers[playerId]) {
-    clearTimeout(room.disconnectTimers[playerId]);
-    delete room.disconnectTimers[playerId];
-  }
+  clearPlayerDisconnectTimers(room, playerId);
 
   // যদি প্লেয়ার ইতিমধ্যে রুমের প্লেয়ার লিস্টে থাকে (যেমন অ্যাপ মিনিমাইজ করে আবার জয়েন কল করলে)
   if (room.players[playerId] && !asAudience) {
@@ -597,10 +612,7 @@ router.delete('/rooms/:code', (req, res) => {
   const room = rooms.get(req.params.code);
   if (!room) return res.status(404).json({ error: 'Room not found' });
 
-  if (room.disconnectTimers && room.disconnectTimers[playerId]) {
-    clearTimeout(room.disconnectTimers[playerId]);
-    delete room.disconnectTimers[playerId];
-  }
+  clearPlayerDisconnectTimers(room, playerId);
 
   if (isHost && room.hostId === playerId) {
     broadcastToRoom(req.params.code, { type: 'ROOM_DELETED', reason: 'Host deleted room' });
@@ -753,11 +765,8 @@ function handleWsMessage(socketId, msg) {
 
       const room = rooms.get(roomCode);
       if (room) {
-        // প্লেয়ার ফিরে এলে তার ডিসকানেক্ট টাইমার বাতিল করা হবে
-        if (room.disconnectTimers && room.disconnectTimers[playerId]) {
-          clearTimeout(room.disconnectTimers[playerId]);
-          delete room.disconnectTimers[playerId];
-        }
+        // প্লেয়ার ফিরে এলে তার ও হোস্টের ডিসকানেক্ট টাইমার বাতিল করা হবে
+        clearPlayerDisconnectTimers(room, playerId);
         // যদি গেম চলাকালীন ডিসকানেক্ট হয়ে বট বসে গিয়ে থাকে, তবে অটো-রিভাইভ করে তার সিট ফিরিয়ে দেওয়া হবে
         tryReviveDisconnectedPlayer(roomCode, room, playerId);
       }
@@ -767,6 +776,19 @@ function handleWsMessage(socketId, msg) {
 
       if (conn.ws && conn.ws.readyState === WebSocket.OPEN) {
         conn.ws.send(JSON.stringify({ type: 'REGISTERED', playerId, roomCode }));
+      }
+
+      // ── গেম চলাকালীন রিকানেক্ট বা রেজিস্টার করলেই প্লেয়ারকে বর্তমান স্টেট ও পেন্ডিং টার্ন সিঙ্ক করে দেওয়া হবে ──
+      if (room && room.status === 'PLAYING' && room.game) {
+        const gameModule = AVAILABLE_GAMES[room.gameType];
+        const slot = getSlotIndex(room, playerId);
+        if (gameModule) {
+          if (slot !== -1 && typeof gameModule.syncPromotedAudience === 'function') {
+            gameModule.syncPromotedAudience(roomCode, playerId, slot);
+          } else if (typeof gameModule.handleGameAction === 'function') {
+            gameModule.handleGameAction(roomCode, playerId, { type: 'REQUEST_SYNC' });
+          }
+        }
       }
       return; 
     }
@@ -793,14 +815,17 @@ function handleWsMessage(socketId, msg) {
       conn.isAway = false;
       const room = rooms.get(conn.roomCode);
       if (room) {
-        if (room.disconnectTimers && room.disconnectTimers[conn.playerId]) {
-          clearTimeout(room.disconnectTimers[conn.playerId]);
-          delete room.disconnectTimers[conn.playerId];
-        }
+        clearPlayerDisconnectTimers(room, conn.playerId);
         tryReviveDisconnectedPlayer(conn.roomCode, room, conn.playerId);
         const senderIdx = getSlotIndex(room, conn.playerId);
         if (senderIdx !== -1) {
           gameEvent(conn.roomCode, 'PLAYER_AWAY_STATE', { slot: senderIdx, isAway: false, playerName: room.players[conn.playerId]?.name });
+          if (room.status === 'PLAYING' && room.game) {
+            const gameModule = AVAILABLE_GAMES[room.gameType];
+            if (gameModule && typeof gameModule.syncPromotedAudience === 'function') {
+              gameModule.syncPromotedAudience(conn.roomCode, conn.playerId, senderIdx);
+            }
+          }
         }
         updateRoomActivity(conn.roomCode);
         broadcastRoomUpdate(conn.roomCode);
