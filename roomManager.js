@@ -29,12 +29,12 @@ module.exports.playerConnections = playerConnections;
 // ============================================================
 const game29Module = require('./games/game29');
 const ludoModule = require('./games/ludo'); 
-const callbreakModule = require('./games/callbreak'); // ── CallBreak Module Added ──
+const callbreakModule = require('./games/callbreak'); // ── CallBreak Module ইমপোর্ট করা হলো ──
 
 const AVAILABLE_GAMES = {
   '29': game29Module,
   'ludo': ludoModule, 
-  'callbreak': callbreakModule, // ── CallBreak Registered ──
+  'callbreak': callbreakModule, // ── CallBreak রেজিস্টার করা হলো ──
 };
 
 // ============================================================
@@ -126,7 +126,8 @@ function broadcastRoomUpdate(roomCode) {
       allowAudience: room.allowAudience, sessionId: room.sessionId,
       players: room.players, requests: room.requests, audiences: room.audiences,
       playerPresence: buildPlayerPresence(room),
-      prizePool: room.prizePool || 0 
+      prizePool: room.prizePool || 0,
+      customRules: room.customRules || {}
     },
   });
 }
@@ -144,6 +145,7 @@ function tryReviveDisconnectedPlayer(roomCode, room, playerId) {
   const slot = oldData.slot;
   const playerName = oldData.name;
 
+  // যদি ওই স্লটে এখনো বট থাকে বা স্লটটি খালি থাকে
   const currentOccupantEntry = Object.entries(room.players).find(([, p]) => p.slot === slot);
   if (!currentOccupantEntry || currentOccupantEntry[1].isBot) {
     if (currentOccupantEntry) {
@@ -161,6 +163,7 @@ function tryReviveDisconnectedPlayer(roomCode, room, playerId) {
     });
     gameEvent(roomCode, 'PLAYER_REJOINED', { playerId, slot, playerName });
 
+    // শুধুমাত্র যদি প্লেয়ারের সকেট ইতিমধ্যে কানেক্টেড থাকে, তবেই সাথে সাথে সিঙ্ক পাঠানো হবে
     const sid = playerConnections.get(playerId);
     const conn = sid ? connections.get(sid) : null;
     if (conn && conn.ws && conn.ws.readyState === WebSocket.OPEN) {
@@ -178,6 +181,7 @@ function tryReviveDisconnectedPlayer(roomCode, room, playerId) {
   return false;
 }
 
+// ── Check if at least one real human player is online and active in the room ──
 function hasActiveHumanPlayer(room) {
   if (!room || !room.players) return false;
   return Object.keys(room.players).some((pid) => {
@@ -190,6 +194,7 @@ function hasActiveHumanPlayer(room) {
   });
 }
 
+// ── Update room activity status & track when it becomes empty of active humans ──
 function updateRoomActivity(roomCode) {
   const room = rooms.get(roomCode);
   if (!room) return;
@@ -202,8 +207,9 @@ function updateRoomActivity(roomCode) {
   }
 }
 
-const INACTIVE_ROOM_TIMEOUT_MS = 5 * 60 * 1000; 
-const AUDIENCE_CHAT_COOLDOWN_MS = 5 * 60 * 1000; 
+// ── Background interval that deletes any room with no active human for > 5 minutes ──
+const INACTIVE_ROOM_TIMEOUT_MS = 5 * 60 * 1000; // 5 Minutes
+const AUDIENCE_CHAT_COOLDOWN_MS = 5 * 60 * 1000; // অডিয়েন্সের জন্য ৫ মিনিটে ১টি মেসেজ
 
 setInterval(() => {
   const now = Date.now();
@@ -222,7 +228,7 @@ setInterval(() => {
       }
     }
   });
-}, 15 * 1000); 
+}, 15 * 1000); // প্রতি ১৫ সেকেন্ডে চেক করবে
 
 module.exports.broadcastToRoom = broadcastToRoom;
 module.exports.broadcastRoomUpdate = broadcastRoomUpdate;
@@ -233,12 +239,12 @@ module.exports.gameEvent = gameEvent;
 // ============================================================
 
 function getFeeBasedOnLevel(level) {
-  if (level <= 20) return 150;        
-  else if (level <= 40) return 200;   
-  else if (level <= 60) return 250;   
-  else if (level <= 80) return 300;   
-  else if (level <= 100) return 350;  
-  else return 400;                    
+  if (level <= 20) return 150;        // Bronze
+  else if (level <= 40) return 200;   // Silver
+  else if (level <= 60) return 250;   // Gold
+  else if (level <= 80) return 300;   // Platinum
+  else if (level <= 100) return 350;  // Diamond
+  else return 400;                    // Master (max 120)
 }
 
 function calculateDynamicLevel(xp) {
@@ -316,6 +322,7 @@ router.get('/rooms', (req, res) => {
     if (room.type !== 'public') return;
     if (gameType && room.gameType !== gameType && gameType !== 'all') return; 
 
+    // যদি ৫ মিনিটের বেশি সময় ধরে কোনো অ্যাক্টিভ হিউম্যান না থাকে, তবে লিস্টেও দেখাবে না এবং ডিলিট করে দেবে
     if (!hasActiveHumanPlayer(room) && room.emptySince && (Date.now() - room.emptySince >= INACTIVE_ROOM_TIMEOUT_MS)) {
       rooms.delete(code);
       return;
@@ -333,7 +340,8 @@ router.get('/rooms', (req, res) => {
         allowsAudience: room.allowAudience, 
         status: room.status,
         gameType: room.gameType,
-        playMode: room.playMode
+        playMode: room.playMode,
+        customRules: room.customRules || {}
       });
     }
   });
@@ -350,19 +358,21 @@ router.get('/rooms/:code', (req, res) => {
     playerCount: Object.keys(room.players).length,
     players: room.players, requests: room.requests, audiences: room.audiences,
     playerPresence: buildPlayerPresence(room),
+    customRules: room.customRules || {}
   });
 });
 
 router.post('/rooms/create', (req, res) => {
-  const { playerId, playerName, type, allowAudience, gameType, playMode } = req.body;
+  const { playerId, playerName, type, allowAudience, gameType, playMode, customRules } = req.body;
   if (!playerId || !playerName) return res.status(400).json({ error: 'playerId and playerName required' });
 
   rooms.forEach((r, code) => { if (r.hostId === playerId) rooms.delete(code); });
 
   const roomCode = generateRoomCode();
-  const finalGameType = gameType || '29'; 
+  const finalGameType = String(gameType || '29').toLowerCase(); 
   const finalPlayMode = playMode || (finalGameType === '29' ? 'team' : 'individual'); 
 
+  // ডিফল্টভাবে হোস্ট সবসময় স্লট ১ (index 0)-এ থাকবে
   rooms.set(roomCode, {
     hostId: playerId, hostName: playerName,
     status: 'WAITING',
@@ -379,8 +389,9 @@ router.post('/rooms/create', (req, res) => {
     disconnectedPlayers: {},
     disconnectTimers: {},
     prizePool: 0, 
+    customRules: customRules || {}
   });
-  res.json({ success: true, roomCode, gameType: finalGameType, playMode: finalPlayMode });
+  res.json({ success: true, roomCode, gameType: finalGameType, playMode: finalPlayMode, customRules: customRules || {} });
 });
 
 router.post('/rooms/:code/join', (req, res) => {
@@ -390,45 +401,49 @@ router.post('/rooms/:code/join', (req, res) => {
   const room = rooms.get(req.params.code);
   if (!room) return res.status(404).json({ error: 'Room not found' });
 
+  // যদি এই প্লেয়ারের কোনো ডিসকানেক্ট টাইমার চলে থাকে, তা বাতিল করা হলো
   clearPlayerDisconnectTimers(room, playerId);
 
+  // যদি প্লেয়ার ইতিমধ্যে রুমের প্লেয়ার লিস্টে থাকে (যেমন অ্যাপ মিনিমাইজ করে আবার জয়েন কল করলে)
   if (room.players[playerId] && !asAudience) {
     room.players[playerId].name = playerName;
     room.emptySince = null;
     broadcastRoomUpdate(req.params.code);
-    return res.json({ role: 'player', reason: 'already_in_room', gameType: room.gameType, playMode: room.playMode });
+    return res.json({ role: 'player', reason: 'already_in_room', gameType: room.gameType, playMode: room.playMode, customRules: room.customRules || {} });
   }
 
+  // ডিসকানেক্ট হওয়া প্লেয়ার ফিরে এলে সিট ফিরিয়ে দেওয়া
   if (tryReviveDisconnectedPlayer(req.params.code, room, playerId)) {
-    return res.json({ role: 'player', reason: 'rejoined', gameType: room.gameType, playMode: room.playMode });
+    return res.json({ role: 'player', reason: 'rejoined', gameType: room.gameType, playMode: room.playMode, customRules: room.customRules || {} });
   }
 
   if (asAudience) {
     if (!room.allowAudience) return res.status(403).json({ error: 'Audience not allowed' });
     room.audiences[playerId] = { name: playerName };
     broadcastRoomUpdate(req.params.code);
-    return res.json({ role: 'audience', gameType: room.gameType, playMode: room.playMode });
+    return res.json({ role: 'audience', gameType: room.gameType, playMode: room.playMode, customRules: room.customRules || {} });
   }
 
   if (room.status === 'PLAYING') {
     if (!room.allowAudience) return res.status(403).json({ error: 'Game in progress' });
     room.audiences[playerId] = { name: playerName };
     broadcastRoomUpdate(req.params.code);
-    return res.json({ role: 'audience', reason: 'game_started', gameType: room.gameType, playMode: room.playMode });
+    return res.json({ role: 'audience', reason: 'game_started', gameType: room.gameType, playMode: room.playMode, customRules: room.customRules || {} });
   }
 
   if (Object.keys(room.players).length >= 4) {
     if (!room.allowAudience) return res.status(403).json({ error: 'Room full' });
     room.audiences[playerId] = { name: playerName };
     broadcastRoomUpdate(req.params.code);
-    return res.json({ role: 'audience', reason: 'room_full', gameType: room.gameType, playMode: room.playMode });
+    return res.json({ role: 'audience', reason: 'room_full', gameType: room.gameType, playMode: room.playMode, customRules: room.customRules || {} });
   }
 
   room.requests[playerId] = { name: playerName };
   broadcastRoomUpdate(req.params.code);
-  res.json({ role: 'requested', gameType: room.gameType, playMode: room.playMode });
+  res.json({ role: 'requested', gameType: room.gameType, playMode: room.playMode, customRules: room.customRules || {} });
 });
 
+// ── নির্দিষ্ট স্লটে (যেমন ২ নম্বর খালি রেখে ৩ নম্বর স্লটে) প্লেয়ার অ্যাসাইন করার আপডেট ──
 router.post('/rooms/:code/admit', (req, res) => {
   const { hostId, playerId, slot: requestedSlot } = req.body;
   const room = rooms.get(req.params.code);
@@ -442,6 +457,7 @@ router.post('/rooms/:code/admit', (req, res) => {
   if (requestedSlot !== undefined && requestedSlot !== null) {
     const parsedSlot = Number(requestedSlot);
     if (parsedSlot >= 0 && parsedSlot < 4) {
+      // যদি ওই স্লটে কোনো বট থাকে তবে বট সরিয়ে প্লেয়ার বসবে, আর রিয়েল প্লেয়ার থাকলে এরর দেবে
       const existingEntry = Object.entries(room.players).find(([, p]) => p.slot === parsedSlot);
       if (!existingEntry) {
         assignedSlot = parsedSlot;
@@ -485,6 +501,7 @@ router.post('/rooms/:code/reject', (req, res) => {
   res.json({ success: true });
 });
 
+// ── হোস্ট কর্তৃক অ্যাসাইন করা প্লেয়ারকে স্লট থেকে সরানো (Unassign করে অপেক্ষমান তালিকায় পাঠানো বা রুম থেকে কিক করা) ──
 router.post('/rooms/:code/remove_player', (req, res) => {
   const { hostId, targetPlayerId, moveToRequests } = req.body;
   const room = rooms.get(req.params.code);
@@ -509,6 +526,7 @@ router.post('/rooms/:code/remove_player', (req, res) => {
   res.json({ success: true });
 });
 
+// ── হোস্ট কর্তৃক নির্দিষ্ট অডিয়েন্সকে রিমুভ করা ──
 router.post('/rooms/:code/kick_audience', (req, res) => {
   const { hostId, audienceId } = req.body;
   const room = rooms.get(req.params.code);
@@ -523,6 +541,7 @@ router.post('/rooms/:code/kick_audience', (req, res) => {
   res.json({ success: true });
 });
 
+// ── হোস্ট কর্তৃক যেকোনো সময় অডিয়েন্স দেখা চালু বা বন্ধ করা ──
 router.post('/rooms/:code/toggle_audience', (req, res) => {
   const { hostId, allowAudience } = req.body;
   const room = rooms.get(req.params.code);
@@ -531,6 +550,7 @@ router.post('/rooms/:code/toggle_audience', (req, res) => {
 
   room.allowAudience = Boolean(allowAudience);
 
+  // যদি অডিয়েন্স বন্ধ করে দেওয়া হয়, তবে বর্তমান সকল অডিয়েন্সকে রুম থেকে বের করে দেওয়া হবে
   if (!room.allowAudience && room.audiences) {
     Object.keys(room.audiences).forEach((aid) => {
       sendToPlayer(aid, { type: 'AUDIENCE_DISABLED', reason: 'Host disabled audience viewing' });
@@ -542,12 +562,31 @@ router.post('/rooms/:code/toggle_audience', (req, res) => {
   res.json({ success: true, allowAudience: room.allowAudience });
 });
 
+// ── হোস্ট কর্তৃক কাস্টম রুলস আপডেট করার রাউট (CallBreak ও অন্যান্য গেমের জন্য) ──
+router.post('/rooms/:code/rules', (req, res) => {
+  const { hostId, customRules } = req.body;
+  const room = rooms.get(req.params.code);
+  if (!room) return res.status(404).json({ error: 'Room not found' });
+  if (room.hostId !== hostId) return res.status(403).json({ error: 'Not the host' });
+
+  if (customRules && typeof customRules === 'object') {
+    room.customRules = { ...(room.customRules || {}), ...customRules };
+  }
+  broadcastRoomUpdate(req.params.code);
+  res.json({ success: true, customRules: room.customRules });
+});
+
+// ── START GAME: ENTRY FEE DEDUCTION LOGIC ──
 router.post('/rooms/:code/start', async (req, res) => {
-  const { hostId, sessionId } = req.body;
+  const { hostId, sessionId, customRules } = req.body;
   const room = rooms.get(req.params.code);
   
   if (!room) return res.status(404).json({ error: 'Room not found' });
   if (room.hostId !== hostId) return res.status(403).json({ error: 'Not the host' });
+
+  if (customRules && typeof customRules === 'object') {
+    room.customRules = { ...(room.customRules || {}), ...customRules };
+  }
 
   const realPlayers = Object.keys(room.players).filter(pid => !room.players[pid].isBot);
   let totalPrizePool = 0;
@@ -586,7 +625,7 @@ router.post('/rooms/:code/start', async (req, res) => {
 
   const gameModule = AVAILABLE_GAMES[room.gameType];
   if (gameModule && gameModule.initGame) {
-    gameModule.initGame(req.params.code);
+    gameModule.initGame(req.params.code, room.customRules || {});
   }
 
   res.json({ success: true, sessionId: sid });
@@ -750,7 +789,9 @@ function handleWsMessage(socketId, msg) {
 
       const room = rooms.get(roomCode);
       if (room) {
+        // প্লেয়ার ফিরে এলে তার ও হোস্টের ডিসকানেক্ট টাইমার বাতিল করা হবে
         clearPlayerDisconnectTimers(room, playerId);
+        // যদি গেম চলাকালীন ডিসকানেক্ট হয়ে বট বসে গিয়ে থাকে, তবে অটো-রিভাইভ করে তার সিট ফিরিয়ে দেওয়া হবে
         tryReviveDisconnectedPlayer(roomCode, room, playerId);
       }
       
@@ -761,6 +802,7 @@ function handleWsMessage(socketId, msg) {
         conn.ws.send(JSON.stringify({ type: 'REGISTERED', playerId, roomCode }));
       }
 
+      // ── গেম চলাকালীন রিকানেক্ট বা রেজিস্টার করলেই প্লেয়ারকে বর্তমান স্টেট ও পেন্ডিং টার্ন সিঙ্ক করে দেওয়া হবে ──
       if (room && room.status === 'PLAYING' && room.game) {
         const gameModule = AVAILABLE_GAMES[room.gameType];
         const slot = getSlotIndex(room, playerId);
@@ -827,6 +869,7 @@ function handleWsMessage(socketId, msg) {
           msg.senderName ||
           'Player';
 
+        // অডিয়েন্স হলে প্রতি ৫ মিনিটে ১টি মেসেজ পাঠানোর সীমা চেক করা হবে
         if (isAudienceMember) {
           room.audienceChatTimestamps = room.audienceChatTimestamps || {};
           const lastSent = room.audienceChatTimestamps[conn.playerId] || 0;
@@ -853,6 +896,22 @@ function handleWsMessage(socketId, msg) {
       }
       return;
     }
+    // ── ওয়েবসকেটের মাধ্যমেও হোস্ট কর্তৃক কাস্টম রুলস পরিবর্তন (CallBreak ও অন্যান্য গেমের জন্য) ──
+    case 'ACTION_SET_RULES':
+    case 'ACTION_UPDATE_RULES': {
+      const room = rooms.get(conn.roomCode);
+      if (!room || room.hostId !== conn.playerId) return;
+      if (msg.rules && typeof msg.rules === 'object') {
+        room.customRules = { ...(room.customRules || {}), ...msg.rules };
+        if (room.game && room.game.rules) {
+          room.game.rules = { ...room.game.rules, ...msg.rules };
+        }
+        broadcastRoomUpdate(conn.roomCode);
+        gameEvent(conn.roomCode, 'RULES_UPDATED', { rules: room.customRules });
+      }
+      return;
+    }
+    // ── ওয়েবসকেটের মাধ্যমেও হোস্ট কর্তৃক প্লেয়ার রিমুভ/আন-অ্যাসাইন ও অডিয়েন্স কন্ট্রোল ──
     case 'REMOVE_PLAYER':
     case 'UNASSIGN_PLAYER': {
       const room = rooms.get(conn.roomCode);
@@ -922,6 +981,7 @@ function handleDisconnect(socketId) {
       room.disconnectTimers = room.disconnectTimers || {};
 
       if (isAudience) {
+        // অডিয়েন্স অন্য অ্যাপে গেলে বা নেট ফ্ল্যাকচুয়েট করলে অন্তত ৬০ সেকেন্ড সময় পাবে ফিরে আসার
         room.disconnectTimers[playerId] = setTimeout(() => {
           if (!playerConnections.has(playerId) && rooms.has(roomCode)) {
             const rCheck = rooms.get(roomCode);
@@ -932,6 +992,9 @@ function handleDisconnect(socketId) {
           }
         }, 60 * 1000);
       } else {
+        // ── রিয়েল প্লেয়ার বা হোস্ট ডিসকানেক্ট হলে:
+        // লবিতে (WAITING) থাকলে সাথে সাথে হোস্ট পরিবর্তন বা ১০ সেকেন্ডে কিক করা হবে না!
+        // ৫ মিনিট (INACTIVE_ROOM_TIMEOUT_MS) সময় দেওয়া হবে যাতে লিংক শেয়ার করে বা অন্য অ্যাপ থেকে ফিরে আসতে পারে।
         if (room.status === 'WAITING') {
           broadcastRoomUpdate(roomCode);
 
@@ -941,6 +1004,7 @@ function handleDisconnect(socketId) {
               if (!rCheck) return;
 
               if (rCheck.hostId === playerId) {
+                // ৫ মিনিটেও হোস্ট ফিরে না এলে অন্য কোনো অনলাইন হিউম্যান প্লেয়ার থাকলে তাকে হোস্ট বানানো হবে
                 const nextHostId = Object.keys(rCheck.players).find(
                   pid => pid !== playerId && !rCheck.players[pid].isBot && playerConnections.has(pid)
                 );
@@ -963,10 +1027,12 @@ function handleDisconnect(socketId) {
             }
           }, INACTIVE_ROOM_TIMEOUT_MS);
         } else if (room.game && room.status === 'PLAYING') {
+          // ── গেম চলাকালীন (PLAYING) ডিসকানেক্ট হলে ──
           const slot = getSlotIndex(room, playerId);
           broadcastRoomUpdate(roomCode);
           gameEvent(roomCode, 'PLAYER_DISCONNECTED', { playerId, slot });
 
+          // হোস্ট যদি গেম চলাকালীন ডিসকানেক্ট হয়, তবে সাথে সাথে হোস্ট না বদলে অন্তত ২ মিনিট অপেক্ষা করবে
           if (room.hostId === playerId) {
             room.disconnectTimers[`host_${playerId}`] = setTimeout(() => {
               if (!playerConnections.has(playerId) && rooms.has(roomCode)) {
