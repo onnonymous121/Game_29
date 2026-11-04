@@ -17,6 +17,7 @@ initializeApp({ credential: cert(serviceAccount) });
 
 const User = require('./models/User');
 const roomManager = require('./roomManager');
+const cricketRoomManager = require('./cricketRoomManager');
 
 const app = express();
 app.use(express.json());
@@ -65,6 +66,8 @@ httpServer.on('upgrade', (request, socket, head) => {
   wss.handleUpgrade(request, socket, head, (ws) => {
     if (pathname === '/ws/game29' || pathname === '/ws/games') {
       roomManager.handleConnection(ws);
+    } else if (pathname === '/ws/cricket') {
+      cricketRoomManager.handleConnection(ws);
     } else {
       ws.close();
     }
@@ -277,6 +280,7 @@ app.post('/api/reward-coins', async (req, res) => {
 });
 
 app.use('/game29', roomManager.router);
+app.use('/cricket', cricketRoomManager.router);
 
 app.get('/', (req, res) => res.send('Global Game Hub Server Running!'));
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
