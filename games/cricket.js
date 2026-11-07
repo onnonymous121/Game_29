@@ -5,7 +5,7 @@
  * - Fast & Crisp Audio Messages (Zero TTS Lag)
  * - Bowler & Batter "Are You Ready?" Interactive Handshake
  * - Broadcasted 3D Bowler Run-up Audio (Panning based on Off/Middle/Leg line)
- * - 5-Second Ping-Pong Keep-Alive Support
+ * - 5-Second Ping-Pong Keep-Alive Support & Full State Recovery on SYNC_STATE
  * - Dynamic Overs, ICC Bowler Quota, DRS Review & 3D Fielding Mechanics
  */
 
@@ -114,7 +114,8 @@ function initGame(roomCode) {
     message: `${room.teamAName} vs ${room.teamBName}. ${g.totalOvers} overs.`
   });
 
-  setTimeout(() => performToss(roomCode), 1200);
+  // Perform toss after 1.5s so clients have completed screen transition
+  setTimeout(() => performToss(roomCode), 1500);
 }
 
 function getTeamSlots(room, team) {
@@ -255,6 +256,9 @@ function handleTossDecision(roomCode, choice) {
   const room = cricketRoomManager.cricketRooms.get(roomCode);
   if (!room || !room.game) return;
   const g = room.game;
+  if (g.phase !== 'TOSS') return;
+
+  if (!g.tossWinnerTeam) g.tossWinnerTeam = 'A';
 
   if (choice === 'BAT') {
     g.battingTeam = g.tossWinnerTeam;
@@ -1438,6 +1442,8 @@ function handleGameAction(roomCode, playerId, msg) {
     case 'REQUEST_SYNC':
       cricketRoomManager.gameEvent(roomCode, 'SYNC_STATE', {
         phase: g.phase,
+        tossWinnerTeam: g.tossWinnerTeam,
+        tossWinnerCaptainSlot: g.tossWinnerTeam ? getCaptainSlot(room, g.tossWinnerTeam) : 0,
         innings: g.innings,
         score: g.score,
         wickets: g.wickets,
@@ -1464,7 +1470,7 @@ function handleGameAction(roomCode, playerId, msg) {
       break;
 
     case 'ACTION_TOSS_DECISION':
-      if (senderSlot === getCaptainSlot(room, g.tossWinnerTeam)) {
+      if (senderSlot === getCaptainSlot(room, g.tossWinnerTeam) || senderSlot === 0) {
         handleTossDecision(roomCode, msg.choice === 'BOWL' ? 'BOWL' : 'BAT');
       }
       break;
