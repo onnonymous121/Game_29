@@ -938,6 +938,69 @@ function handleGameAction(roomCode, playerId, msg) {
       break;
     }
 
+    case 'HOST_SYNC_REQUEST': {
+      // হোস্ট সিঙ্ক রিকোয়েস্ট পাঠালে রুমে উপস্থিত সব প্লেয়ার ও অডিয়েন্সকে লেটেস্ট স্টেট সিঙ্ক পাঠানো হবে
+      if (room.hostId !== playerId) break;
+
+      const buildSyncPayload = (targetSlot, targetAudience) => {
+        let handStr = '';
+        if (!targetAudience && targetSlot !== -1 && gs.hands[targetSlot]) {
+          handStr = gs.hands[targetSlot].join(',');
+        }
+
+        return {
+          slot: targetSlot,
+          isAudience: targetAudience,
+          hand: handStr,
+          turnIndex: gs.turnIndex,
+          roundStarterIndex: gs.roundStarterIndex,
+          trumpSuit: gs.trumpSuit,
+          isTrumpRevealed: gs.isTrumpRevealed,
+          currentTrickTrumpRevealer: gs.currentTrickTrumpRevealer,
+          leadSuit: gs.leadSuit,
+          handsPlayed: gs.handsPlayed,
+          isBiddingPhase: gs.isBiddingPhase,
+          isWaitingForTrump: gs.isWaitingForTrump,
+          currentBid: gs.currentBid,
+          bidder: gs.bidder,
+          highestBidder: gs.highestBidder,
+          currentBidderIdx: gs.currentBidderIdx,
+          teamScore0: gs.teamScores[0],
+          teamScore1: gs.teamScores[1],
+          gamePointsTeam0: gs.gamePoints[0],
+          gamePointsTeam1: gs.gamePoints[1],
+          isDoublePhase: gs.isDoublePhase,
+          isRedoublePhase: gs.isRedoublePhase,
+          isDoubled: gs.isDoubled,
+          isRedoubled: gs.isRedoubled,
+          gamePointMultiplier: gs.gamePointMultiplier,
+          isSingleHandPhase: gs.isSingleHandPhase,
+          singleHandDeclarer: gs.singleHandDeclarer,
+          sittingOutPlayer: gs.sittingOutPlayer,
+          passedPlayers: gs.passedPlayers,
+          pairShown: gs.pairShown,
+          currentTrick: gs.currentTrick.map(pc => `${pc.playerIndex}-${pc.card}`).join(','),
+        };
+      };
+
+      // ১. সক্রিয় খেলোয়াড়দের স্টেট সিঙ্ক করা
+      Object.entries(room.players).forEach(([pid, p]) => {
+        if (!p.isBot) {
+          const syncData = buildSyncPayload(p.slot, false);
+          rm.gameEvent(roomCode, 'SYNC_STATE', syncData, pid);
+        }
+      });
+
+      // ২. অডিয়েন্সদের স্টেট সিঙ্ক করা
+      if (room.audiences) {
+        Object.keys(room.audiences).forEach(audId => {
+          const syncData = buildSyncPayload(-1, true);
+          rm.gameEvent(roomCode, 'SYNC_STATE', syncData, audId);
+        });
+      }
+      break;
+    }
+
     case 'ACTION_BID': {
       if (senderIdx === -1) break;
       if (msg.bid === 'PASS') applyBidPass(roomCode, senderIdx);
