@@ -245,7 +245,7 @@ function startNewRound(roomCode) {
 }
 
 // ============================================================
-// BIDDING PHASE (1 - 8)
+// BIDDING PHASE (1 - 13)
 // ============================================================
 function processBidTurn(roomCode) {
   const room = rm.rooms.get(roomCode);
@@ -286,7 +286,7 @@ function applyBid(roomCode, senderIdx, bid) {
   if (!gs.isBiddingPhase || gs.currentBidderIdx !== senderIdx) return;
 
   gs.bids[senderIdx] = bid;
-  gs.bidsCount = gs.bids.filter(b => isAtLeast(b, 1) && isAtMost(b, 8)).length;
+  gs.bidsCount = gs.bids.filter(b => isAtLeast(b, 1) && isAtMost(b, 13)).length;
   rm.gameEvent(roomCode, 'BID_INFO', { senderIdx, bid });
 
   gs.currentBidderIdx = (gs.currentBidderIdx + 1) % 4;
@@ -306,7 +306,7 @@ function botBid(roomCode, idx) {
   const extraSpades = Math.max(0, spades.length - 3);
 
   const estimated = Math.round(acesAndKings * 0.8 + highSpades * 0.9 + extraSpades * 0.7);
-  const suggestedBid = Math.min(8, Math.max(1, estimated));
+  const suggestedBid = Math.min(13, Math.max(1, estimated));
 
   applyBid(roomCode, idx, suggestedBid);
 }
@@ -552,7 +552,7 @@ function evaluateTrick(roomCode) {
   gs.leadSuit = null;
   gs.isTrickEvaluating = false;
 
-  if (gs.rules.eightTricksAutoWin && gs.bids[winner] === 8 && isAtLeast(gs.trickWins[winner], 8)) {
+  if (gs.rules.eightTricksAutoWin && isAtLeast(gs.bids[winner], 8) && isAtLeast(gs.trickWins[winner], gs.bids[winner])) {
     resolveRound(roomCode);
     return;
   }
@@ -688,7 +688,7 @@ function recoverAndUnstuckGame(roomCode, clientReport = null, reporterSlot = -1)
     }
   }
 
-  const validBidsCount = gs.bids.filter(b => isAtLeast(b, 1) && isAtMost(b, 8)).length;
+  const validBidsCount = gs.bids.filter(b => isAtLeast(b, 1) && isAtMost(b, 13)).length;
   gs.bidsCount = validBidsCount;
   if (gs.isBiddingPhase && isAtLeast(validBidsCount, 4)) {
     gs.isBiddingPhase = false;
@@ -862,7 +862,7 @@ function handleGameAction(roomCode, playerId, msg) {
     case 'ACTION_BID': {
       if (senderIdx === -1 || gs.isRuleSelectionPhase) break;
       const bid = parseInt(msg.bid, 10);
-      if (!isNaN(bid) && isAtLeast(bid, 1) && isAtMost(bid, 8)) {
+      if (!isNaN(bid) && isAtLeast(bid, 1) && isAtMost(bid, 13)) {
         applyBid(roomCode, senderIdx, bid);
       }
       break;
