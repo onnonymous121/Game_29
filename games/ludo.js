@@ -12,16 +12,23 @@ const SAFE_ZONES = [1, 9, 14, 22, 27, 35, 40, 48];
 const START_POSITIONS = { 0: 1, 1: 14, 2: 27, 3: 40 };
 const FINISH_POS = 56; // 51..55 হলো Safe 53..57 এবং 56 হলো 58 (Finish)
 
-// ফাস্ট এবং স্মুথ সার্ভার টাইমিং (মিলিসেকেন্ডে)
+// প্রফেশনাল অ্যানিমেশন ও সাউন্ডের সাথে মিল রেখে সার্ভার টাইমিং (মিলিসেকেন্ডে)
 const DELAYS = {
   GAME_START: 800,
-  DICE_ANIM: 450,
+  DICE_ANIM: 600,
+  STEP_HOP: 165,
   TOKEN_MOVE: 450,
-  TOKEN_CUT: 900,
-  TURN_CHANGE: 300,
+  TOKEN_CUT: 950,
+  TURN_CHANGE: 350,
   NO_MOVE: 650,
   BOT_THINK: 650
 };
+
+function getMoveAnimDelay(diceVal, isUnlock, isCut) {
+  const hops = isUnlock ? 1 : Math.max(1, Number(diceVal) || 1);
+  const baseTime = (hops * DELAYS.STEP_HOP) + 280;
+  return isCut ? Math.max(DELAYS.TOKEN_CUT, baseTime + 350) : Math.max(DELAYS.TOKEN_MOVE, baseTime);
+}
 
 function newLudoState(playMode) {
   return {
@@ -196,20 +203,62 @@ function initGame(roomCode) {
   scheduleNextStep(roomCode, nextAction, DELAYS.GAME_START);
 }
 
+function broadcastFullRoomSync(roomCode) {
+  const room = rm.rooms.get(roomCode);
+  if (!room || !room.game) return;
+
+  Object.keys(room.players).forEach(pid => {
+    const p = room.players[pid];
+    if (!p.isBot) {
+      syncGameState(roomCode, pid, p.slot, false);
+    }
+  });
+
+  if (room.audiences) {
+    Object.keys(room.audiences).forEach(aid => {
+      syncGameState(roomCode, aid, -1, true);
+    });
+  }
+}
+
 function handleGameAction(roomCode, playerId, msg) {
   const room = rm.rooms.get(roomCode);
   if (!room || !room.game) return;
   const gs = room.game;
   
   let senderIdx = -1;
-  const isAudience = !!room.audiences[playerId];
+  const isAudience = !!(room.audiences && room.audiences[playerId]);
   
   if (!isAudience) {
       senderIdx = room.players[playerId] ? room.players[playerId].slot : -1;
+      // কোনো ডিসকানেক্টেড বা অ্যাওয়ে প্লেয়ার কোনো অ্যাকশন পাঠালেই তার স্ট্যাটাস অনলাইন করে সবাইকে জানানো হবে
+      if (senderIdx !== -1 && gs.playerPresence[senderIdx] !== 'online') {
+          gs.playerPresence[senderIdx] = 'online';
+          const pName = room.players[playerId] ? room.players[playerId].name : `Player ${senderIdx + 1}`;
+          rm.gameEvent(roomCode, 'PLAYER_PRESENCE_UPDATED', {
+              slot: senderIdx,
+              status: 'online',
+              playerName: pName,
+              players: room.players,
+              playerPresence: gs.playerPresence
+          });
+      }
   }
 
   if (msg.type === 'REQUEST_SYNC') {
       syncGameState(roomCode, playerId, senderIdx, isAudience);
+      return;
+  }
+
+  if (msg.type === 'HOST_SYNC_REQUEST') {
+      if (room.hostId !== playerId) return;
+      broadcastFullRoomSync(roomCode);
+      return;
+  }
+
+  if (msg.type === 'TOGGLE_VOICE_CALL') {
+      if (room.hostId !== playerId) return;
+      rm.gameEvent(roomCode, 'TOGGLE_VOICE_CALL', { isAllowed: !!msg.isAllowed });
       return;
   }
   
@@ -324,11 +373,29 @@ function handleGameAction(roomCode, playerId, msg) {
       break;
     case 'ACTION_AWAY':
       gs.playerPresence[senderIdx] = 'away';
-      rm.broadcastToRoom(roomCode, { type: 'GAME_EVENT', event: 'PLAYER_AWAY', payload: { playerIdx: senderIdx, playerPresence: gs.playerPresence }});
+      rm.broadcastToRoom(roomCode, { 
+        type: 'GAME_EVENT', 
+        event: 'PLAYER_AWAY', 
+        payload: { 
+          slot: senderIdx,
+          playerIdx: senderIdx, 
+          playerName: getPlayerNameBySlot(room, senderIdx),
+          playerPresence: gs.playerPresence 
+        }
+      });
       break;
     case 'ACTION_RETURN':
       gs.playerPresence[senderIdx] = 'online';
-      rm.broadcastToRoom(roomCode, { type: 'GAME_EVENT', event: 'PLAYER_RETURN', payload: { playerIdx: senderIdx, playerPresence: gs.playerPresence }});
+      rm.broadcastToRoom(roomCode, { 
+        type: 'GAME_EVENT', 
+        event: 'PLAYER_RETURN', 
+        payload: { 
+          slot: senderIdx,
+          playerIdx: senderIdx, 
+          playerName: getPlayerNameBySlot(room, senderIdx),
+          playerPresence: gs.playerPresence 
+        }
+      });
       break;
   }
 }
@@ -380,7 +447,7 @@ function getValidMovesDetails(gs, playerIdx) {
                const killDetails = checkAndCutTokenSimulation(gs, ownerIdx, globalPos); 
                if (killDetails) killVictimIdx = killDetails.victimIdx;
              }
-           } else if (newPos > 50 && newPos <= FINISH_POS) {
+           } else if (newPos > 50 && newPos < FINISH_POS) {
              isSafeZone = true;
            }
            
@@ -600,6 +667,7 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
   }
 
   const token = gs.tokens[ownerIdx].find(t => t.id === tokenId);
+  const oldPos = token.pos;
   let eventType = 'TOKEN_MOVED';
 
   let isLuckyZoneHit = false;
@@ -639,12 +707,23 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
 
   if (move.isFinish) gs.rollPhase = true; 
 
+  const dynamicMoveDelay = getMoveAnimDelay(diceValue, move.isUnlock, !!cutDetails);
+
   if (checkWinCondition(gs, ownerIdx)) {
     if (!gs.winners.includes(ownerIdx)) gs.winners.push(ownerIdx);
     
     if (gs.winners.length >= gs.activePlayerCount - 1 || (gs.playMode === 'team' && checkTeamWin(gs))) {
        const finalRankings = buildFinalRankings(room, gs);
-       rm.gameEvent(roomCode, 'TOKEN_FINISHED', { playerIdx, ownerIdx, tokenId, newPos: move.newPos, diceValue, cutDetails });
+       rm.gameEvent(roomCode, 'TOKEN_FINISHED', { 
+           playerIdx, 
+           ownerIdx, 
+           tokenId, 
+           oldPos: oldPos,
+           newPos: move.newPos, 
+           diceValue, 
+           cutDetails,
+           isSafeZone: false
+       });
        scheduleNextStep(roomCode, () => {
          clearAllTimers(roomCode, gs);
          rm.gameEvent(roomCode, 'GAME_OVER', {
@@ -655,7 +734,7 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
          if (rm.resolveUniversalGame) {
            rm.resolveUniversalGame(roomCode, gs.winners);
          }
-       }, DELAYS.TOKEN_MOVE);
+       }, dynamicMoveDelay);
        return;
     }
   }
@@ -667,13 +746,13 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
 
   let expectedAction = 'NONE';
   let nextAction = null;
-  let stepDelay = cutDetails ? DELAYS.TOKEN_CUT : DELAYS.TOKEN_MOVE;
+  let stepDelay = dynamicMoveDelay;
 
   if (gs.rollPhase) {
       expectedAction = 'ROLL';
       if (isBot(room, playerIdx)) {
           nextAction = () => rollDice(roomCode, playerIdx);
-          stepDelay = DELAYS.BOT_THINK;
+          stepDelay = dynamicMoveDelay + 300;
       }
   } else if (remainingMoves.length > 0) {
       expectedAction = remainingMoves.length > 1 ? 'MOVE' : 'NONE';
@@ -685,17 +764,18 @@ function moveToken(roomCode, playerIdx, tokenId, diceValue, ownerIdx) {
                   : remainingMoves[0];
               moveToken(roomCode, playerIdx, nextMove.tokenId, nextMove.diceValue, nextMove.ownerIdx);
           };
-          stepDelay = isBot(room, playerIdx) ? DELAYS.BOT_THINK : DELAYS.TOKEN_MOVE;
+          stepDelay = dynamicMoveDelay + 250;
       }
   } else {
       nextAction = () => changeTurn(roomCode);
-      stepDelay = cutDetails ? DELAYS.TOKEN_CUT : DELAYS.TURN_CHANGE;
+      stepDelay = dynamicMoveDelay;
   }
 
   rm.gameEvent(roomCode, eventType, { 
       playerIdx, 
       ownerIdx, 
       tokenId, 
+      oldPos: oldPos,
       newPos: move.newPos, 
       diceValue, 
       cutDetails,
@@ -773,7 +853,20 @@ function syncGameState(roomCode, playerId, slot, isAudience) {
   const gs = room.game;
 
   if (slot !== -1 && !isAudience) {
+    const wasNotOnline = gs.playerPresence[slot] !== 'online';
     gs.playerPresence[slot] = 'online';
+
+    // যদি প্লেয়ার আগে ডিসকানেক্টেড বা অ্যাওয়ে থাকে এবং এখন সিঙ্ক করে ফিরে আসে, তবে রুমের সবাইকে তার অনলাইন স্ট্যাটাস জানানো হবে
+    if (wasNotOnline) {
+      const pName = room.players[playerId] ? room.players[playerId].name : `Player ${slot + 1}`;
+      rm.gameEvent(roomCode, 'PLAYER_PRESENCE_UPDATED', {
+        slot: slot,
+        status: 'online',
+        playerName: pName,
+        players: room.players,
+        playerPresence: gs.playerPresence
+      });
+    }
   }
 
   const currentValidMoves = (!isAudience && slot === gs.turnIndex && !gs.rollPhase)
@@ -812,7 +905,7 @@ function syncPromotedAudience(roomCode, audienceId, slot) {
     ];
   }
   
-  syncGameState(roomCode, audienceId, slot, false);
+  broadcastFullRoomSync(roomCode);
 }
 
 function handlePlayerDisconnectDuringGame(roomCode, slot) {
@@ -822,6 +915,11 @@ function handlePlayerDisconnectDuringGame(roomCode, slot) {
 
     if (gs.playMode === 'team') {
         gs.playerPresence[slot] = 'bot';
+        rm.gameEvent(roomCode, 'PLAYER_PRESENCE_UPDATED', {
+            slot: slot,
+            status: 'bot',
+            playerPresence: gs.playerPresence
+        });
         checkBotTurn(roomCode);
     } else {
         gs.playerPresence[slot] = 'disconnected';
